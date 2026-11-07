@@ -1,0 +1,58 @@
+# Copy to symphony.yaml (gitignored). All credentials stay in external login stores.
+data_dir: ~/.local/state/symphony-machine
+
+linear:
+  url: https://mcp.linear.app/mcp
+  needs_human_label: needs-human
+
+codex:
+  command: codex
+  args: [app-server, --listen, "stdio://"]
+  linear_mcp_server: linear
+  workflow: ~/.agents/workflows/WORKFLOW.md
+  mode: delegated
+  lead: { model: gpt-6.1-sol, reasoning: xhigh }
+  implementation: { model: gpt-6.1-sol, reasoning: xhigh }
+  review: { model: gpt-6.1-sol, reasoning: xhigh }
+  maintenance: { model: gpt-6.1-sol, reasoning: xhigh }
+
+polling:
+  linear_seconds: 30
+  review_seconds: 60
+  github_seconds: 30
+  master_ci_seconds: 60
+
+concurrency:
+  execution_tickets: 3
+  reviews: 1
+  maintenance_scans: 1
+
+maintenance:
+  enabled: true
+  interval_hours: 24
+  idle_only: true
+  max_open_tickets: 5
+  policy: >-
+    Only bounded maintenance that preserves public behavior, has concrete
+    evidence and clear acceptance criteria. No speculative abstractions or
+    stylistic rewrites. Other proposals remain Backlog.
+
+repositories:
+  - id: my-project
+    path: ~/projects/my-project
+    github: YOUR-OWNER/YOUR-REPO
+    branch: master # Set main if that is the actual integration branch.
+    remote: origin
+    team: YOUR-LINEAR-TEAM-ID
+    project: YOUR-LINEAR-PROJECT-ID
+    auto_merge: true
+    # Names or workflow file paths. Empty means all observed workflows for current SHA;
+    # no CI evidence is unknown, never silently healthy.
+    required_workflows: [ci.yml]
+    states:
+      todo: Todo
+      in_progress: In Progress
+      review: In Review
+      blocked: Blocked
+      done: Done
+      backlog: Backlog

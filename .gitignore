@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+symphony.yaml
+.symphony/
+*.sqlite*
+*.log
+.DS_Store
+
+**/linear-oauth.json
