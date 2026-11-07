@@ -1,6 +1,6 @@
 # Symphony Machine
 
-A personal Linear → Codex → GitHub workflow runner. Runs in the foreground inside tmux. No hosted service, Desktop dependency, GitHub merge queue, or API-key billing integration.
+A personal Linear → Codex → GitHub workflow runner. Runs in the foreground. No hosted service, Desktop dependency, GitHub merge queue, or API-key billing integration.
 
 You handle intake, issues marked `needs-human`, and Blocked work. The machine polls approved tickets, executes them in isolated Git worktrees, reviews PRs, merges them serially per repository, and removes merged worktrees and branches. It also diagnoses failing target-branch CI and periodically creates bounded maintenance tickets.
 
@@ -48,14 +48,13 @@ npm start -- doctor --config symphony.yaml
 
 Doctor checks installed git/gh, repository paths, workflow availability, Codex ChatGPT login, agent MCP availability, and a controller Linear read. It does not execute an agent task or test GitHub write privileges. `gh` and Git must already have access to each configured remote.
 
-## Run in tmux
+## Run
 
 ```bash
-tmux new -s symphony
 npm start -- run --config symphony.yaml
 ```
 
-Detach with tmux's usual `Ctrl+B`, then `D`. The process owns an independent `codex app-server --listen stdio://` child. No daemon or system service is installed.
+The process owns an independent `codex app-server --listen stdio://` child. No daemon or system service is installed.
 
 - First `Ctrl+C`: stop admitting new jobs and drain active jobs.
 - Second `Ctrl+C`: interrupt active turns, preserve worktrees and save continuation information.
