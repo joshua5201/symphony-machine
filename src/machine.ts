@@ -5,9 +5,13 @@ import { GitHub, type PrInfo } from "./github.js";
 import { CodexRunner } from "./codex.js";
 import type { LinearClient, LinearIssue } from "./linear.js";
 import { Store, type Job } from "./store.js";
+import { maintenanceDirections } from "./maintenance.js";
+import type { DashboardSnapshot, DashboardTicket } from "./dashboard.js";
 import {
   contract,
+  executionInstructions,
   executionPrompt,
+  executionSkill,
   maintenancePrompt,
   reviewPrompt,
 } from "./prompts.js";
@@ -33,12 +37,32 @@ type Sync = {
   comment?: string;
 };
 export type Log = (event: string, details?: unknown) => void;
+// These arguments are displayed for manual copying, never executed by the runner.
+const shellArgument = (value: string) =>
+  /^[A-Za-z0-9_./:@=-]+$/.test(value)
+    ? value
+    : "'" + value.replaceAll("'", "'\"'\"'") + "'";
 export class Machine {
   private active = new Map<
     string,
-    { job: Job; abort: AbortController; promise: Promise<void> }
+    {
+      job: Job;
+      abort: AbortController;
+      promise: Promise<void>;
+      issue?: LinearIssue;
+      startedAt: string;
+    }
+  >();
+  private dashboardState = new Map<
+    string,
+    {
+      issues: Map<string, LinearIssue>;
+      updatedAt: string | null;
+      stale: boolean;
+    }
   >();
   private next = new Map<string, number>();
+  private retryAfter = new Map<string, number>();
   private stopping = false;
   constructor(
     public config: Config,
@@ -49,12 +73,15 @@ export class Machine {
     private githubFactory = (r: Repo) => new GitHub(gitConfig(r)),
   ) {}
   reload(c: Config) {
+    const repositorySettings = (config: Config) =>
+      config.repositories.map(({ concurrency, ...settings }) => settings);
     if (
       c.data_dir !== this.config.data_dir ||
+      JSON.stringify(c.dashboard) !== JSON.stringify(this.config.dashboard) ||
       JSON.stringify(c.codex) !== JSON.stringify(this.config.codex) ||
       JSON.stringify(c.linear) !== JSON.stringify(this.config.linear) ||
-      JSON.stringify(c.repositories) !==
-        JSON.stringify(this.config.repositories)
+      JSON.stringify(repositorySettings(c)) !==
+        JSON.stringify(repositorySettings(this.config))
     )
       throw new Error(
         "Runtime/repository changes require restart; polling/concurrency/maintenance settings can reload",
@@ -76,9 +103,197 @@ export class Machine {
     }
     this.config = c;
     this.next.clear();
+    this.retryAfter.clear();
   }
   get activeCount() {
     return this.active.size;
+  }
+  dashboard(): DashboardSnapshot {
+    const jobs = this.store.jobs();
+    return {
+      updatedAt: new Date().toISOString(),
+      projects: this.config.repositories.map((r) => ({
+        id: r.id,
+        name: r.id,
+        repository: r.github,
+        ticketsUpdatedAt: this.dashboardState.get(r.id)?.updatedAt ?? null,
+        ticketsStale: this.dashboardState.get(r.id)?.stale ?? true,
+        tickets: this.dashboardTickets(r, jobs),
+        maintenance: jobs
+          .filter((j) => j.repo === r.id && j.role === "maintenance")
+          .reverse()
+          .map((j) => ({
+            id: j.id,
+            theme:
+              maintenanceDirections.find(
+                (d) => d.id === j.maintenance?.direction,
+              )?.focus ?? "General maintenance",
+            status: j.status,
+            summary: j.summary ?? null,
+            startedAt: j.startedAt,
+            updatedAt: j.updatedAt,
+            from: j.maintenance?.from ?? null,
+            to: j.maintenance?.to ?? null,
+          })),
+      })),
+    };
+  }
+  private dashboardTickets(r: Repo, jobs: Job[]): DashboardTicket[] {
+    const history = jobs.filter(
+      (j) => j.repo === r.id && (j.role === "execution" || j.role === "review"),
+    );
+    const cached = this.dashboardState.get(r.id)?.issues;
+    const identities = new Map(
+      [...(cached?.values() ?? [])].flatMap(
+        (issue) =>
+          [
+            [issue.id, issue.id],
+            [issue.identifier, issue.id],
+          ] as [string, string][],
+      ),
+    );
+    const ids = new Set([
+      ...(cached?.keys() ?? []),
+      ...history.map((j) => identities.get(j.issueId) ?? j.issueId),
+      ...jobs
+        .filter((j) => j.repo === r.id)
+        .flatMap((j) => j.createdIssueIds ?? [])
+        .map((id) => identities.get(id) ?? id),
+    ]);
+    return [...ids].map((id): DashboardTicket => {
+      const active = [...this.active.values()].find(
+        (a) =>
+          a.job.repo === r.id &&
+          (identities.get(a.job.issueId) ?? a.job.issueId) === id &&
+          a.issue,
+      );
+      const issue = cached?.get(id) ?? active?.issue;
+      const previous = history
+        .filter((j) => (identities.get(j.issueId) ?? j.issueId) === id)
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+      const agent = active?.job ?? previous;
+      const state = issue?.state ?? null;
+      const column: DashboardTicket["column"] =
+        state === r.states.todo
+          ? "todo"
+          : state === r.states.in_progress
+            ? "in_progress"
+            : state === r.states.review
+              ? "review"
+              : state === r.states.blocked
+                ? "blocked"
+                : state === r.states.done
+                  ? "done"
+                  : "other";
+      const blockedAt =
+        issue?.stateHistory
+          ?.filter((entry) => entry.state === r.states.blocked)
+          .map((entry) => entry.startedAt)
+          .sort()
+          .at(-1) ?? null;
+      return {
+        id,
+        identifier: issue?.identifier ?? previous?.identifier ?? id,
+        title: issue?.title ?? previous?.identifier ?? id,
+        url: issue?.url ?? "",
+        mode: issue
+          ? issue.labels.includes("Symphony mode/Direct") ||
+            issue.labels.includes("Direct")
+            ? "Direct"
+            : "Delegated"
+          : null,
+        role:
+          agent?.role === "execution" || agent?.role === "review"
+            ? agent.role
+            : null,
+        agentStatus: active
+          ? "running"
+          : agent?.status === "running"
+            ? "waiting"
+            : (agent?.status ?? null),
+        resumeCommand: agent?.threadId
+          ? [
+              this.config.codex.command,
+              "resume",
+              agent.threadId,
+              "--cd",
+              r.path,
+              ...(agent.workspace && !this.store.get(`cleaned:${agent.id}`)
+                ? ["--add-dir", agent.workspace.path]
+                : []),
+            ]
+              .map(shellArgument)
+              .join(" ")
+          : null,
+        column,
+        state,
+        needsHumanReview:
+          issue?.labels.includes(this.config.linear.needs_human_label) ?? false,
+        startedAt:
+          active?.startedAt ?? issue?.startedAt ?? previous?.startedAt ?? null,
+        completedAt: issue?.completedAt ?? null,
+        blockedAt,
+      };
+    });
+  }
+  private async pollDashboard(r: Repo) {
+    const previous = this.dashboardState.get(r.id);
+    try {
+      const todo = await this.linear.listIssues({
+        team: r.team,
+        project: r.project,
+        state: r.states.todo,
+      });
+      const issues = new Map(todo.map((issue) => [issue.id, issue]));
+      const ids = new Set(
+        this.store
+          .jobs()
+          .filter((j) => j.repo === r.id)
+          .flatMap((j) => [
+            ...(j.role === "execution" || j.role === "review"
+              ? [j.issueId]
+              : []),
+            ...(j.createdIssueIds ?? []),
+          ]),
+      );
+      let stale = false;
+      for (const id of ids) {
+        if (
+          issues.has(id) ||
+          [...issues.values()].some((issue) => issue.identifier === id)
+        )
+          continue;
+        try {
+          const issue = await this.linear.getIssue(id);
+          issues.set(issue.id, issue);
+        } catch (error) {
+          stale = true;
+          const retained =
+            previous?.issues.get(id) ??
+            [...(previous?.issues.values() ?? [])].find(
+              (issue) => issue.identifier === id,
+            );
+          if (retained) issues.set(retained.id, retained);
+          this.log("dashboard_poll_error", {
+            repo: r.id,
+            issue: id,
+            error: String(error),
+          });
+        }
+      }
+      this.dashboardState.set(r.id, {
+        issues,
+        updatedAt: new Date().toISOString(),
+        stale,
+      });
+    } catch (error) {
+      this.dashboardState.set(r.id, {
+        issues: previous?.issues ?? new Map(),
+        updatedAt: previous?.updatedAt ?? null,
+        stale: true,
+      });
+      this.log("dashboard_poll_error", { repo: r.id, error: String(error) });
+    }
   }
   stop(force = false) {
     this.stopping = true;
@@ -97,8 +312,10 @@ export class Machine {
       }
     this.log("recovered", { jobs: this.store.jobs().length });
   }
-  private count(role: Job["role"]) {
-    return [...this.active.values()].filter((a) => a.job.role === role).length;
+  private count(role: Job["role"], repo: string) {
+    return [...this.active.values()].filter(
+      (a) => a.job.role === role && a.job.repo === repo,
+    ).length;
   }
   private due(key: string, seconds: number, now: number) {
     if (now < (this.next.get(key) ?? 0)) return false;
@@ -109,6 +326,12 @@ export class Machine {
     return (
       this.store.get<boolean>("pause:all") ||
       this.store.get<boolean>(`pause:${repo}`)
+    );
+  }
+  private skipIssue(issue: LinearIssue) {
+    return (
+      issue.labels.includes(this.config.linear.needs_human_label) ||
+      issue.labels.includes(this.config.linear.no_auto_pickup_label)
     );
   }
   private job(repo: string, issueId: string, role: Job["role"]) {
@@ -158,29 +381,55 @@ export class Machine {
     await this.flush();
     if (this.stopping) return;
     for (const r of this.config.repositories) {
-      if (this.paused(r.id)) continue;
-      try {
-        if (
-          this.due(`${r.id}:health`, this.config.polling.master_ci_seconds, now)
-        )
-          await this.health(r);
-        if (
-          this.due(`${r.id}:github`, this.config.polling.github_seconds, now)
-        ) {
-          await this.cleanup(r);
-          await this.merge(r);
+      if (!this.paused(r.id) && now >= (this.retryAfter.get(r.id) ?? 0)) {
+        try {
+          if (
+            this.due(
+              `${r.id}:health`,
+              this.config.polling.master_ci_seconds,
+              now,
+            )
+          )
+            await this.health(r);
+          if (
+            this.due(`${r.id}:github`, this.config.polling.github_seconds, now)
+          ) {
+            await this.cleanup(r);
+            await this.merge(r);
+          }
+          if (
+            this.due(`${r.id}:review`, this.config.polling.review_seconds, now)
+          )
+            await this.reviews(r);
+          if (
+            this.due(`${r.id}:linear`, this.config.polling.linear_seconds, now)
+          )
+            await this.executions(r);
+          await this.maintenance(r, now);
+        } catch (error) {
+          // A failed poll must remain a gate on subsequent ticks, even when
+          // the failed lane's original deadline has not arrived yet.
+          for (const key of this.next.keys())
+            if (key.startsWith(`${r.id}:`)) this.next.delete(key);
+          this.retryAfter.set(
+            r.id,
+            now + this.config.polling.linear_seconds * 1000,
+          );
+          this.log("poll_error", { repo: r.id, error: String(error) });
         }
-        if (this.due(`${r.id}:review`, this.config.polling.review_seconds, now))
-          await this.reviews(r);
-        if (this.due(`${r.id}:linear`, this.config.polling.linear_seconds, now))
-          await this.executions(r);
-        await this.maintenance(r, now);
-      } catch (error) {
-        this.log("poll_error", { repo: r.id, error: String(error) });
       }
+      if (
+        this.config.dashboard.enabled &&
+        this.due(`dashboard:${r.id}`, this.config.polling.linear_seconds, now)
+      )
+        await this.pollDashboard(r);
     }
   }
-  private launch(j: Job, fn: (signal: AbortSignal) => Promise<void>) {
+  private launch(
+    j: Job,
+    fn: (signal: AbortSignal) => Promise<void>,
+    issue?: LinearIssue,
+  ) {
     if (this.stopping || this.active.has(j.id)) return;
     j.status = "running";
     this.store.save(j);
@@ -200,8 +449,7 @@ export class Machine {
         if (
           !abort.signal.aborted &&
           !this.runner.failure &&
-          j.role !== "maintenance" &&
-          j.role !== "merge"
+          j.role === "review"
         ) {
           const r = this.config.repositories.find((r) => r.id === j.repo)!;
           this.sync({
@@ -213,9 +461,20 @@ export class Machine {
       })
       .finally(() => {
         this.active.delete(j.id);
-        this.log("job_finished", { job: j.id, status: j.status });
+        this.log("job_finished", {
+          job: j.id,
+          issue: j.identifier,
+          role: j.role,
+          status: j.status,
+        });
       });
-    this.active.set(j.id, { job: j, abort, promise });
+    this.active.set(j.id, {
+      job: j,
+      abort,
+      promise,
+      issue,
+      startedAt: new Date().toISOString(),
+    });
     this.log("job_started", { job: j.id, issue: j.identifier, role: j.role });
   }
   async dependenciesReady(issue: LinearIssue, r: Repo): Promise<boolean> {
@@ -238,11 +497,7 @@ export class Machine {
           continue;
         }
         if (full.state !== r.states.done) return false;
-        if (
-          !full.description.includes("[No PR required]") &&
-          !this.store.get(`no_pr:${full.id}`)
-        )
-          return false;
+        if (!full.description.includes("[No PR required]")) return false;
         continue;
       }
       for (const url of full.prUrls) {
@@ -290,46 +545,46 @@ export class Machine {
           Number(b.title.startsWith("[Maintenance]")),
     );
     for (const issue of issues) {
-      if (this.count("execution") >= c.concurrency.execution_tickets) break;
+      if (this.count("execution", r.id) >= r.concurrency.execution_tickets)
+        break;
       const old = this.job(r.id, issue.id, "execution");
       if (old && this.active.has(old.id)) continue;
       const recovering =
         old?.status === "waiting" && issue.state === r.states.in_progress;
       if (issue.state !== r.states.todo && !recovering) continue;
-      if (issue.labels.includes(c.linear.needs_human_label)) continue;
+      if (this.skipIssue(issue)) continue;
       if (old?.status === "failed" && old.fingerprint === issue.updatedAt)
         continue;
       if (old?.workspace && this.store.get(`cleaned:${old.id}`)) continue;
       if (!(await this.dependenciesReady(issue, r))) continue;
       const j = old ?? this.create(r, issue, "execution");
       j.fingerprint = issue.updatedAt;
-      if (!recovering) {
-        j.phase = "plan";
-        j.handoff = undefined;
-        j.workerSummary = undefined;
-      }
-      this.launch(j, async (signal) => {
-        const route = routing(c, issue.labels);
-        const git = this.githubFactory(r);
-        if (!j.workspace) j.workspace = await git.prepare(issue.identifier);
-        this.store.save(j);
-        await this.linear.updateIssue(issue.id, {
-          state: r.states.in_progress,
-        });
-        while (true) {
-          const worker = route.mode === "delegated" && j.phase === "implement";
-          const settings = worker ? route.implementation : route.lead;
+      this.launch(
+        j,
+        async (signal) => {
+          const route = routing(c, issue.labels);
+          const git = this.githubFactory(r);
+          if (!j.workspace) j.workspace = await git.prepare(issue.identifier);
+          this.store.save(j);
           const response = await this.runner.run({
-            threadId: worker ? j.workerThreadId : j.threadId,
-            title: `${issue.identifier} · ${worker ? "Implementation" : "Lead"}`,
-            cwd: j.workspace.path,
-            developerInstructions: contract(c, r),
-            prompt: executionPrompt(c, r, issue, j, route.mode),
-            ...settings,
+            threadId: j.threadId,
+            title: `${issue.identifier} · Lead`,
+            cwd: r.path,
+            writableRoots: [j.workspace.path],
+            outputFormat: "text",
+            skills: [executionSkill],
+            config: {
+              "agents.enabled": true,
+              "agents.default_subagent_model": route.implementation.model,
+              "agents.default_subagent_reasoning_effort":
+                route.implementation.reasoning,
+            },
+            developerInstructions: executionInstructions,
+            prompt: executionPrompt(c, r, issue, j),
+            ...route.lead,
             signal,
             onThread: (id) => {
-              if (worker) j.workerThreadId = id;
-              else j.threadId = id;
+              j.threadId = id;
               this.store.save(j);
             },
           });
@@ -338,85 +593,27 @@ export class Machine {
             this.store.save(j);
             return;
           }
-          if (response.outcome !== "completed" || !response.result)
+          if (response.outcome !== "completed")
             throw new Error(response.error ?? `Agent ${response.outcome}`);
-          const result = response.result;
-          j.summary = result.summary;
-          if (
-            result.decision === "blocked" ||
-            result.decision === "needs_human"
-          ) {
-            j.status = "blocked";
-            this.sync({
-              issueId: issue.id,
-              state: r.states.blocked,
-              comment: result.summary,
-            });
-            break;
-          }
-          if (
-            !worker &&
-            result.decision === "done" &&
-            issue.id === this.store.get(`repair:${r.id}`)
-          ) {
-            const health = await git.masterHealth();
-            if (health.status !== "success")
-              throw new Error(
-                "CI-only repair completion requires confirmed healthy target CI",
-              );
-            this.store.set(`health:${r.id}`, health);
-            this.store.set(`no_pr:${issue.id}`, true);
-            j.status = "done";
-            this.sync({
-              issueId: issue.id,
-              state: r.states.done,
-              comment: `Target CI recovered without a PR. ${result.summary}\nDiagnostic worktree retained; no unmerged work was deleted.`,
-            });
-            break;
-          }
-          if (route.mode === "delegated" && j.phase === "plan") {
-            if (result.decision !== "implement" || !result.handoff)
-              throw new Error("Lead did not return an implementation handoff");
-            j.handoff = result.handoff;
-            j.phase = "implement";
-            this.store.save(j);
-            continue;
-          }
-          if (worker) {
-            if (result.decision !== "review" && result.decision !== "done")
-              throw new Error("Implementation did not report completion");
-            j.workerSummary = result.summary;
-            j.phase = "verify";
-            this.store.save(j);
-            continue;
-          }
-          if (result.decision !== "review")
-            throw new Error(
-              `Execution must publish reviewable work, got ${result.decision}`,
-            );
-          const pr = result.prNumber
-            ? await git.pr(result.prNumber)
-            : await git.findPr(j.workspace.branch);
-          if (
-            !pr ||
-            pr.branch !== j.workspace.branch ||
-            pr.base !== r.branch ||
-            pr.state !== "OPEN"
-          )
-            throw new Error(
-              "Execution did not produce its own open PR targeting the configured branch",
-            );
-          j.prNumber = pr.number;
-          j.status = "done";
-          this.sync({
-            issueId: issue.id,
-            state: r.states.review,
-            comment: `Ready for review: ${pr.url}\n${result.summary}`,
-          });
-          break;
-        }
-        this.store.save(j);
-      });
+          const latest = await this.linear.getIssue(issue.id);
+          const pr = await git.findPr(j.workspace.branch);
+          if (pr && pr.branch === j.workspace.branch && pr.base === r.branch)
+            j.prNumber = pr.number;
+          j.summary = response.text;
+          j.fingerprint = latest.updatedAt;
+          j.status =
+            latest.state === r.states.review || latest.state === r.states.done
+              ? "done"
+              : latest.state === r.states.blocked ||
+                  latest.labels.includes(c.linear.needs_human_label)
+                ? "blocked"
+                : latest.state === r.states.in_progress
+                  ? "waiting"
+                  : "failed";
+          this.store.save(j);
+        },
+        issue,
+      );
     }
   }
   private async reviews(r: Repo) {
@@ -427,11 +624,11 @@ export class Machine {
     });
     for (const issue of issues) {
       if (
-        this.count("review") + this.count("merge") >=
-        this.config.concurrency.reviews
+        this.count("review", r.id) + this.count("merge", r.id) >=
+        r.concurrency.reviews
       )
         break;
-      if (issue.labels.includes(this.config.linear.needs_human_label)) continue;
+      if (this.skipIssue(issue)) continue;
       const execution = this.job(r.id, issue.id, "execution");
       const own = issue.prUrls
         .map((u) =>
@@ -455,80 +652,84 @@ export class Machine {
       j.fingerprint = fingerprint;
       j.prNumber = number;
       j.head = pr.head;
-      this.launch(j, async (signal) => {
-        const response = await this.runner.run({
-          threadId: j.threadId,
-          title: `${issue.identifier} · Review`,
-          cwd: r.path,
-          developerInstructions: contract(this.config, r),
-          prompt: reviewPrompt(this.config, r, issue, number, pr.head),
-          ...this.config.codex.review,
-          signal,
-          onThread: (id) => {
-            j.threadId = id;
+      this.launch(
+        j,
+        async (signal) => {
+          const response = await this.runner.run({
+            threadId: j.threadId,
+            title: `${issue.identifier} · Review`,
+            cwd: r.path,
+            developerInstructions: contract(this.config, r),
+            prompt: reviewPrompt(this.config, r, issue, number, pr.head),
+            ...this.config.codex.review,
+            signal,
+            onThread: (id) => {
+              j.threadId = id;
+              this.store.save(j);
+            },
+          });
+          if (response.outcome === "interrupted") {
+            j.status = "waiting";
+            j.fingerprint = undefined;
             this.store.save(j);
-          },
-        });
-        if (response.outcome === "interrupted") {
-          j.status = "waiting";
-          j.fingerprint = undefined;
+            return;
+          }
+          if (response.outcome !== "completed" || !response.result)
+            throw new Error(response.error ?? `Review ${response.outcome}`);
+          const result = response.result;
+          j.summary = result.summary;
+          j.status = "done";
+          const current = await this.githubFactory(r).pr(number);
+          const latestIssue = await this.linear.getIssue(issue.id);
+          if (
+            current.head !== pr.head ||
+            latestIssue.description !== issue.description ||
+            latestIssue.title !== issue.title ||
+            latestIssue.state !== r.states.review
+          ) {
+            j.fingerprint = undefined;
+            this.store.save(j);
+            return;
+          }
+          j.fingerprint = `${current.head}:${current.updatedAt}:${latestIssue.updatedAt}`;
+          if (result.decision === "ready_to_merge")
+            this.store.set(`merge:${r.id}:${issue.id}`, {
+              issueId: issue.id,
+              pr: number,
+              head: pr.head,
+              summary: result.summary,
+              updatedAt: latestIssue.updatedAt,
+              prUpdatedAt: current.updatedAt,
+            } satisfies Decision);
+          else if (result.decision === "needs_human")
+            this.sync({
+              issueId: issue.id,
+              labels: [
+                ...new Set([
+                  ...latestIssue.labels,
+                  this.config.linear.needs_human_label,
+                ]),
+              ],
+              comment: result.summary,
+            });
+          else if (result.decision === "needs_changes") {
+            this.sync({
+              issueId: issue.id,
+              state: r.states.todo,
+              comment: result.summary,
+            });
+            this.store.set(`merge:${r.id}:${issue.id}`, null);
+          } else if (result.decision === "blocked")
+            this.sync({
+              issueId: issue.id,
+              state: r.states.blocked,
+              comment: result.summary,
+            });
+          else throw new Error(`Invalid review decision: ${result.decision}`);
           this.store.save(j);
-          return;
-        }
-        if (response.outcome !== "completed" || !response.result)
-          throw new Error(response.error ?? `Review ${response.outcome}`);
-        const result = response.result;
-        j.summary = result.summary;
-        j.status = "done";
-        const current = await this.githubFactory(r).pr(number);
-        const latestIssue = await this.linear.getIssue(issue.id);
-        if (
-          current.head !== pr.head ||
-          latestIssue.description !== issue.description ||
-          latestIssue.title !== issue.title ||
-          latestIssue.state !== r.states.review
-        ) {
-          j.fingerprint = undefined;
-          this.store.save(j);
-          return;
-        }
-        j.fingerprint = `${current.head}:${current.updatedAt}:${latestIssue.updatedAt}`;
-        if (result.decision === "ready_to_merge")
-          this.store.set(`merge:${r.id}:${issue.id}`, {
-            issueId: issue.id,
-            pr: number,
-            head: pr.head,
-            summary: result.summary,
-            updatedAt: latestIssue.updatedAt,
-            prUpdatedAt: current.updatedAt,
-          } satisfies Decision);
-        else if (result.decision === "needs_human")
-          this.sync({
-            issueId: issue.id,
-            labels: [
-              ...new Set([
-                ...latestIssue.labels,
-                this.config.linear.needs_human_label,
-              ]),
-            ],
-            comment: result.summary,
-          });
-        else if (result.decision === "needs_changes") {
-          this.sync({
-            issueId: issue.id,
-            state: r.states.todo,
-            comment: result.summary,
-          });
-          this.store.set(`merge:${r.id}:${issue.id}`, null);
-        } else if (result.decision === "blocked")
-          this.sync({
-            issueId: issue.id,
-            state: r.states.blocked,
-            comment: result.summary,
-          });
-        else throw new Error(`Invalid review decision: ${result.decision}`);
-        this.store.save(j);
-      });
+        },
+        issue,
+      );
     }
   }
   private async health(r: Repo) {
@@ -562,7 +763,7 @@ export class Machine {
     if (!r.auto_merge) return;
     const health = this.store.get<Health>(`health:${r.id}`);
     if (!health) return;
-    const candidates = this.store
+    const approved = this.store
       .jobs()
       .filter(
         (j) => j.repo === r.id && j.role === "review" && j.status === "done",
@@ -572,6 +773,11 @@ export class Machine {
         decision: this.store.get<Decision | null>(`merge:${r.id}:${j.issueId}`),
       }))
       .filter((x) => x.decision);
+    const candidates: typeof approved = [];
+    for (const candidate of approved) {
+      const issue = await this.linear.getIssue(candidate.decision!.issueId);
+      if (!this.skipIssue(issue)) candidates.push(candidate);
+    }
     candidates.sort(
       (a, b) =>
         Number(b.decision!.issueId === this.store.get(`repair:${r.id}`)) -
@@ -597,8 +803,8 @@ export class Machine {
       )
         return;
       if (
-        this.count("merge") + this.count("review") >=
-        this.config.concurrency.reviews
+        this.count("merge", r.id) + this.count("review", r.id) >=
+        r.concurrency.reviews
       )
         return;
       const j = this.create(
@@ -666,7 +872,7 @@ export class Machine {
       const issue = await this.linear.getIssue(d.issueId);
       if (
         issue.state !== r.states.review ||
-        issue.labels.includes(this.config.linear.needs_human_label) ||
+        this.skipIssue(issue) ||
         !(await this.dependenciesReady(issue, r))
       )
         continue;
@@ -733,13 +939,11 @@ export class Machine {
     }
   }
   private async merged(r: Repo, issue: LinearIssue, pr: PrInfo) {
+    if (pr.state !== "MERGED" || pr.base !== r.branch)
+      throw new Error(
+        "Merged PR does not target the configured integration branch",
+      );
     this.store.set(`merge:${r.id}:${issue.id}`, null);
-    // An execution PR may have additional delivery requirements; reviewer must explicitly validate them.
-    this.sync({
-      issueId: issue.id,
-      state: r.states.done,
-      comment: `Merged ${pr.url}. Managed workspace cleanup will follow; CI health is monitored separately.`,
-    });
     const j = this.job(r.id, issue.id, "execution");
     if (j?.workspace) {
       j.prNumber = pr.number;
@@ -752,24 +956,28 @@ export class Machine {
     for (const j of this.store
       .jobs()
       .filter(
-        (j) =>
-          j.repo === r.id &&
-          j.role === "execution" &&
-          j.workspace &&
-          j.prNumber,
+        (j) => j.repo === r.id && j.role === "execution" && j.workspace,
       )) {
       if ([...this.active.values()].some((a) => a.job.issueId === j.issueId))
         continue;
       if (this.store.get(`cleaned:${j.id}`)) continue;
       const git = this.githubFactory(r);
-      const pr = await git.pr(j.prNumber!);
-      if (pr.state !== "MERGED") continue;
+      const pr = j.prNumber
+        ? await git.pr(j.prNumber)
+        : await git.findPr(j.workspace!.branch);
+      if (
+        !pr ||
+        pr.state !== "MERGED" ||
+        pr.base !== r.branch ||
+        pr.branch !== j.workspace!.branch
+      )
+        continue;
       if (!this.store.get(`cleanup:${j.id}`)) {
         const issue = await this.linear.getIssue(j.issueId);
         await this.merged(r, issue, pr);
       }
       try {
-        await git.cleanup(j.workspace!, j.prNumber!);
+        await git.cleanup(j.workspace!, pr.number);
         this.store.set(`cleaned:${j.id}`, true);
         this.log("cleaned", { issue: j.identifier });
       } catch (error) {
@@ -789,31 +997,71 @@ export class Machine {
     const c = this.config;
     if (
       !c.maintenance.enabled ||
-      this.count("maintenance") >= c.concurrency.maintenance_scans
+      this.count("maintenance", r.id) >= r.concurrency.maintenance_scans
     )
       return;
     if (
       c.maintenance.idle_only &&
-      (this.count("execution") >= c.concurrency.execution_tickets ||
-        this.count("review") + this.count("merge") > 0)
+      (this.count("execution", r.id) >= r.concurrency.execution_tickets ||
+        this.count("review", r.id) + this.count("merge", r.id) > 0)
     )
       return;
-    if (now < (this.store.get<number>(`maintenance_next:${r.id}`) ?? 0)) return;
-    const j = this.create(
-      r,
-      { id: `maintenance:${r.id}`, identifier: `maintenance:${r.id}` },
-      "maintenance",
-    );
+    if (
+      [...this.active.values()].some(
+        (a) => a.job.repo === r.id && a.job.role === "maintenance",
+      )
+    )
+      return;
+    const history = this.store
+      .jobs()
+      .filter((j) => j.repo === r.id && j.role === "maintenance");
+    const pending = history.find((j) => j.status === "waiting");
+    if (
+      !pending &&
+      now < (this.store.get<number>(`maintenance_next:${r.id}`) ?? 0)
+    )
+      return;
+    const j =
+      pending ??
+      this.create(
+        r,
+        { id: `maintenance:${r.id}`, identifier: `maintenance:${r.id}` },
+        "maintenance",
+      );
     this.store.set(
       `maintenance_next:${r.id}`,
       now + c.maintenance.interval_hours * 3600000,
     );
     this.launch(j, async (signal) => {
+      if (!j.maintenance) {
+        const previous = history.findLast((job) => job.maintenance);
+        const index = maintenanceDirections.findIndex(
+          (d) => d.id === previous?.maintenance?.direction,
+        );
+        const direction =
+          maintenanceDirections[(index + 1) % maintenanceDirections.length].id;
+        const from = history.findLast(
+          (job) =>
+            job.status === "done" && job.maintenance?.direction === direction,
+        )?.maintenance?.to;
+        const to = await this.githubFactory(r).targetCommit();
+        j.maintenance = { direction, from, to };
+        this.store.save(j);
+      }
+      const scan = j.maintenance;
+      if (scan.from === scan.to) {
+        j.status = "done";
+        j.summary = `No new commits for ${scan.direction} at ${scan.to}; skipped agent.`;
+        this.store.save(j);
+        this.log("maintenance_skipped", { repo: r.id, ...scan });
+        return;
+      }
       const result = await this.runner.run({
+        threadId: j.threadId,
         cwd: r.path,
-        title: `${r.id} · Maintenance`,
+        title: `${r.id} · Maintenance · ${scan.direction}`,
         developerInstructions: contract(c, r),
-        prompt: maintenancePrompt(c, r),
+        prompt: maintenancePrompt(c, r, scan),
         ...c.codex.maintenance,
         signal,
         onThread: (id) => {
@@ -821,12 +1069,19 @@ export class Machine {
           this.store.save(j);
         },
       });
+      if (result.outcome === "interrupted") {
+        j.status = "waiting";
+        this.store.save(j);
+        this.log("job_interrupted", { job: j.id, issue: j.identifier });
+        return;
+      }
       if (result.outcome !== "completed" || result.result?.decision !== "done")
         throw new Error(
           result.error ?? result.result?.summary ?? "Maintenance failed",
         );
       j.status = "done";
       j.summary = result.result.summary;
+      j.createdIssueIds = result.result.issueIds ?? [];
       this.store.save(j);
     });
   }

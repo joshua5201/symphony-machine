@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import type { MaintenanceScan } from "./maintenance.js";
 
 export type Job = {
   id: string;
@@ -10,6 +11,7 @@ export type Job = {
   role: "execution" | "review" | "maintenance" | "merge";
   status: "running" | "waiting" | "blocked" | "done" | "failed";
   threadId?: string;
+  // Recovery evidence retained for executions created by the old phase runner.
   workerThreadId?: string;
   phase?: "plan" | "implement" | "verify";
   handoff?: string;
@@ -19,6 +21,8 @@ export type Job = {
   head?: string;
   fingerprint?: string;
   summary?: string;
+  maintenance?: MaintenanceScan;
+  createdIssueIds?: string[];
   startedAt: string;
   updatedAt: string;
 };
@@ -33,7 +37,9 @@ export class Store {
   }
   jobs(): Job[] {
     return (
-      this.db.prepare("SELECT data FROM jobs").all() as { data: string }[]
+      this.db.prepare("SELECT data FROM jobs ORDER BY rowid").all() as {
+        data: string;
+      }[]
     ).map((x) => JSON.parse(x.data));
   }
   save(job: Job) {

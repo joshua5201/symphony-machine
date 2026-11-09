@@ -1,16 +1,22 @@
 # Copy to symphony.yaml (gitignored). All credentials stay in external login stores.
 data_dir: ~/.local/state/symphony-machine
 
+# Bind settings are local configuration; keep personal IPs/domains in symphony.yaml.
+dashboard:
+  enabled: true
+  host: 127.0.0.1 # Use 0.0.0.0 for direct LAN access; restart after changes.
+  port: 4310
+
 linear:
   url: https://mcp.linear.app/mcp
   needs_human_label: needs-human
+  no_auto_pickup_label: no-auto-pickup
 
 codex:
   command: codex
   args: [app-server, --listen, "stdio://"]
   linear_mcp_server: linear
   workflow: ~/.agents/workflows/WORKFLOW.md
-  mode: delegated
   lead: { model: gpt-6.1-sol, reasoning: xhigh }
   implementation: { model: gpt-6.1-sol, reasoning: xhigh }
   review: { model: gpt-6.1-sol, reasoning: xhigh }
@@ -21,11 +27,6 @@ polling:
   review_seconds: 60
   github_seconds: 30
   master_ci_seconds: 60
-
-concurrency:
-  execution_tickets: 3
-  reviews: 1
-  maintenance_scans: 1
 
 maintenance:
   enabled: true
@@ -45,7 +46,12 @@ repositories:
     remote: origin
     team: YOUR-LINEAR-TEAM-ID
     project: YOUR-LINEAR-PROJECT-ID
+    # Worktrees default to <path>/.symphony/worktrees; sessions start at <path>.
     auto_merge: true
+    concurrency:
+      execution_tickets: 3
+      reviews: 1
+      maintenance_scans: 1
     # Names or workflow file paths. Empty means all observed workflows for current SHA;
     # no CI evidence is unknown, never silently healthy.
     required_workflows: [ci.yml]

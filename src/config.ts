@@ -5,6 +5,11 @@ import { parse } from "yaml";
 import { z } from "zod";
 
 const positive = z.number().int().positive();
+const concurrency = z.object({
+  execution_tickets: positive.default(3),
+  reviews: positive.default(1),
+  maintenance_scans: positive.default(1),
+});
 const role = z.object({
   model: z.string().default("gpt-6.1-sol"),
   reasoning: z
@@ -13,10 +18,18 @@ const role = z.object({
 });
 const schema = z.object({
   data_dir: z.string().default("~/.local/state/symphony-machine"),
+  dashboard: z
+    .object({
+      enabled: z.boolean().default(true),
+      host: z.string().min(1).default("127.0.0.1"),
+      port: positive.max(65535).default(4310),
+    })
+    .prefault({}),
   linear: z
     .object({
       url: z.string().url().default("https://mcp.linear.app/mcp"),
       needs_human_label: z.string().default("needs-human"),
+      no_auto_pickup_label: z.string().default("no-auto-pickup"),
     })
     .prefault({}),
   codex: z
@@ -25,7 +38,6 @@ const schema = z.object({
       linear_mcp_server: z.string().default("linear"),
       args: z.array(z.string()).default(["app-server", "--listen", "stdio://"]),
       workflow: z.string().default("~/.agents/workflows/WORKFLOW.md"),
-      mode: z.enum(["direct", "delegated"]).default("delegated"),
       lead: role.prefault({}),
       implementation: role.prefault({}),
       review: role.prefault({}),
@@ -38,13 +50,6 @@ const schema = z.object({
       review_seconds: positive.default(60),
       github_seconds: positive.default(30),
       master_ci_seconds: positive.default(60),
-    })
-    .prefault({}),
-  concurrency: z
-    .object({
-      execution_tickets: positive.default(3),
-      reviews: positive.default(1),
-      maintenance_scans: positive.default(1),
     })
     .prefault({}),
   maintenance: z
@@ -73,6 +78,7 @@ const schema = z.object({
         worktree_root: z.string().optional(),
         required_workflows: z.array(z.string()).default([]),
         auto_merge: z.boolean().default(true),
+        concurrency: concurrency.prefault({}),
         states: z
           .object({
             todo: z.string().default("Todo"),
@@ -115,7 +121,7 @@ export function loadConfig(file: string): Config {
     projects.add(`${r.team}/${r.project}`);
     r.path = expand(r.path, base);
     r.worktree_root = expand(
-      r.worktree_root ?? `${c.data_dir}/worktrees/${r.id}`,
+      r.worktree_root ?? `${r.path}/.symphony/worktrees`,
       base,
     );
   }
@@ -141,7 +147,6 @@ export function routing(c: Config, labels: string[]) {
     return found[0] ?? fallback;
   };
   return {
-    mode: labels.includes("Symphony mode/Direct") ? "direct" : c.codex.mode,
     lead: {
       model: value("Lead model", c.codex.lead.model),
       reasoning: value("Lead reasoning", c.codex.lead.reasoning),

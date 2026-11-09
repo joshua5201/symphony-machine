@@ -45,7 +45,7 @@ const server = String.raw`
         send({ id: 'approval-1', method: config.approval, params: { threadId, turnId, itemId: 'exec', reason: 'Needs permission' } });
       } else if (!config.wait) {
         if (config.earlyCompletion) done(threadId, turnId);
-        else setTimeout(() => done(threadId, turnId, config.status || 'completed', config.invalid ? '{"decision":"oops"}' : value(threadId)), threadId === 'thread-1' ? 15 : 1);
+        else setTimeout(() => done(threadId, turnId, config.status || 'completed', config.text ?? (config.invalid ? '{"decision":"oops"}' : value(threadId))), threadId === 'thread-1' ? 15 : 1);
       }
     } else if (message.method === 'turn/interrupt') {
       result(message, {});
@@ -82,6 +82,11 @@ test("initializes managed ChatGPT auth, streams separate concurrent threads, and
       title: "M-1 Lead",
       model: "my-model",
       reasoning: "xhigh",
+      config: {
+        "agents.enabled": true,
+        "agents.default_subagent_model": "implementation-model",
+        "agents.default_subagent_reasoning_effort": "high",
+      },
       developerInstructions: "Use Linear",
       writableRoots: ["/tmp/repo/.git"],
       onThread: (id) => ids.push(id),
@@ -128,14 +133,27 @@ test("initializes managed ChatGPT auth, streams separate concurrent threads, and
   const thread = calls.find((call) => call.method === "thread/start")!
     .params as Record<string, unknown>;
   assert.equal(thread.developerInstructions, "Use Linear");
+  assert.deepEqual(thread.config, {
+    "agents.enabled": true,
+    "agents.default_subagent_model": "implementation-model",
+    "agents.default_subagent_reasoning_effort": "high",
+  });
   const resumed = await runner.run({
     threadId: a.threadId,
     title: "Should preserve user title",
     cwd: "/tmp/a",
     prompt: "continue",
+    config: { "agents.enabled": false },
   });
   assert.equal(resumed.outcome, "completed");
   assert.equal(resumed.threadId, a.threadId);
+  assert.deepEqual(
+    (
+      requests().find((call) => call.method === "thread/resume")!
+        .params as Record<string, unknown>
+    ).config,
+    { "agents.enabled": false },
+  );
   assert.ok(
     requests().some(
       (call) =>
@@ -158,6 +176,44 @@ test("handles events already queued when turn/start resolves", async (t) => {
     (await runner.run({ cwd: "/tmp", prompt: "work" })).outcome,
     "completed",
   );
+});
+
+test("accepts prose for text runs while keeping default structured output validation", async (t) => {
+  const text =
+    "Implemented and verified the change. The workpad and PR contain the delivery evidence.";
+  const { runner, requests } = setup({ text });
+  t.after(() => runner.close());
+  const prompt = "$symphony-execute Complete the approved issue.";
+  const skill = {
+    name: "symphony-execute",
+    path: "/tmp/skills/symphony-execute/SKILL.md",
+  };
+  const [lead, structured] = await Promise.all([
+    runner.run({
+      cwd: "/tmp",
+      prompt,
+      outputFormat: "text",
+      skills: [skill],
+    }),
+    runner.run({ cwd: "/tmp", prompt: "review" }),
+  ]);
+  assert.deepEqual(lead, {
+    threadId: lead.threadId,
+    outcome: "completed",
+    text,
+  });
+  assert.equal(structured.outcome, "failed");
+  const turns = requests().filter((call) => call.method === "turn/start");
+  const params = (threadId: string) =>
+    turns.find(
+      (call) => (call.params as Record<string, unknown>).threadId === threadId,
+    )!.params as Record<string, unknown>;
+  assert.equal("outputSchema" in params(lead.threadId), false);
+  assert.deepEqual(params(lead.threadId).input, [
+    { type: "text", text: prompt },
+    { type: "skill", ...skill },
+  ]);
+  assert.ok(params(structured.threadId).outputSchema);
 });
 
 test("cancels approval requests, reports blocked, and leaves another thread running", async (t) => {

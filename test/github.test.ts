@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -87,6 +87,23 @@ async function fixture(
   };
 }
 
+test("maintenance target commit follows the remote without changing the shared checkout", async (t) => {
+  const f = await fixture(t);
+  const localHead = await git(f.path, "rev-parse", "HEAD");
+  await writeFile(join(f.path, "base.txt"), "local work in progress\n");
+  await writeFile(join(f.seed, "base.txt"), "remote advance\n");
+  await git(f.seed, "commit", "-am", "advance target");
+  await git(f.seed, "push", "origin", "master");
+  const target = await f.github.targetCommit();
+  assert.equal(target, await git(f.seed, "rev-parse", "HEAD"));
+  assert.notEqual(target, localHead);
+  assert.equal(await git(f.path, "rev-parse", "HEAD"), localHead);
+  assert.equal(
+    await readFile(join(f.path, "base.txt"), "utf8"),
+    "local work in progress\n",
+  );
+});
+
 test("prepare starts from fresh remote target and resumes its owned worktree with dirty work preserved", async (t) => {
   const f = await fixture(t);
   await writeFile(join(f.seed, "new.txt"), "new target\n");
@@ -107,6 +124,27 @@ test("prepare starts from fresh remote target and resumes its owned worktree wit
   assert.equal(
     await readFile(join(workspace.path, "working.txt"), "utf8"),
     "unfinished",
+  );
+});
+
+test("repo-local runtime worktrees stay out of the shared checkout's tracked work", async (t) => {
+  const f = await fixture(t);
+  const config = {
+    ...f.config,
+    worktreeRoot: join(f.path, ".symphony", "worktrees"),
+  };
+  const github = new GitHub(config, f.runner);
+  const workspace = await github.prepare("ENG-1");
+  assert.equal(workspace.path, await realpath(join(config.worktreeRoot, "eng-1")));
+  await writeFile(join(workspace.path, "working.txt"), "unfinished");
+  assert.equal(
+    await git(f.path, "status", "--porcelain", "--untracked-files=all"),
+    "",
+  );
+  assert.match(await git(f.path, "check-ignore", workspace.path), /eng-1$/);
+  assert.match(
+    await git(workspace.path, "status", "--porcelain"),
+    /working\.txt/,
   );
 });
 
@@ -392,4 +430,101 @@ test("updateBranch reports current, updated, and conflict without hiding service
   pr = rawPr("after");
   update = "error";
   await assert.rejects(f.github.updateBranch(7), /network unavailable/);
+});
+
+const androidWorkflows = [
+  {
+    name: "Android debug artifacts",
+    path: ".github/workflows/android-debug.yml",
+    state: "active",
+  },
+  {
+    name: "Website CI",
+    path: ".github/workflows/website-ci.yml",
+    state: "active",
+  },
+  {
+    name: "Prepare Android release PR",
+    path: ".github/workflows/android-release-prep.yml",
+    state: "active",
+  },
+  {
+    name: "Attach signed AABs to draft release",
+    path: ".github/workflows/android-release.yml",
+    state: "active",
+  },
+];
+
+function workflowValidation(
+  requiredWorkflows: string[],
+  workflows = androidWorkflows,
+) {
+  const calls: string[][] = [];
+  const github = new GitHub(
+    {
+      id: "tracker",
+      path: tmpdir(),
+      github: "demo/repo",
+      branch: "main",
+      remote: "origin",
+      worktreeRoot: join(tmpdir(), "unused-worktrees"),
+      requiredWorkflows,
+    },
+    async (file, args) => {
+      assert.equal(
+        file,
+        "gh",
+        "workflow validation must not fetch or mutate Git",
+      );
+      assert.deepEqual(args.slice(0, 2), ["workflow", "list"]);
+      assert.ok(
+        args.includes("--all"),
+        "disabled workflows must be available for diagnostics",
+      );
+      calls.push(args);
+      return okay(JSON.stringify(workflows));
+    },
+  );
+  return { github, calls };
+}
+
+test("workflow preflight accepts the actual Android CI name, filename, and full path without Git mutations", async () => {
+  const { github, calls } = workflowValidation([
+    "Android debug artifacts",
+    "android-debug.yml",
+    ".github/workflows/android-debug.yml",
+  ]);
+  await github.validateWorkflows();
+  assert.equal(calls.length, 1);
+});
+
+test("workflow preflight reports missing ci.yml with the repository's available names and paths", async () => {
+  const { github } = workflowValidation(["ci.yml"]);
+  await assert.rejects(github.validateWorkflows(), (error: Error) => {
+    assert.match(
+      error.message,
+      /Invalid required_workflows for demo\/repo/,
+    );
+    assert.match(error.message, /"ci\.yml" does not exist/);
+    assert.match(
+      error.message,
+      /Android debug artifacts \(\.github\/workflows\/android-debug\.yml, active\)/,
+    );
+    assert.match(
+      error.message,
+      /Configure an existing active CI workflow name or path/,
+    );
+    return true;
+  });
+});
+
+test("workflow preflight rejects an existing disabled CI workflow", async () => {
+  const { github } = workflowValidation(
+    ["android-debug.yml"],
+    [{ ...androidWorkflows[0], state: "disabled_manually" }],
+  );
+  await assert.rejects(
+    github.validateWorkflows(),
+    /"android-debug\.yml" is disabled_manually/,
+  );
 });

@@ -3,7 +3,6 @@ import { createInterface } from "node:readline";
 
 export interface AgentResult {
   decision:
-    | "implement"
     | "review"
     | "ready_to_merge"
     | "needs_changes"
@@ -11,7 +10,6 @@ export interface AgentResult {
     | "blocked"
     | "done";
   summary: string;
-  handoff?: string;
   prNumber?: number;
   issueIds?: string[];
 }
@@ -23,6 +21,9 @@ export interface RunInput {
   prompt: string;
   model?: string;
   reasoning?: string;
+  outputFormat?: "text" | "json";
+  skills?: Array<{ name: string; path: string }>;
+  config?: Record<string, unknown>;
   developerInstructions?: string;
   writableRoots?: string[];
   signal?: AbortSignal;
@@ -33,11 +34,11 @@ export interface RunResult {
   threadId: string;
   outcome: "completed" | "blocked" | "failed" | "interrupted";
   result?: AgentResult;
+  text?: string;
   error?: string;
 }
 
 const decisions = [
-  "implement",
   "review",
   "ready_to_merge",
   "needs_changes",
@@ -52,11 +53,10 @@ const outputSchema = {
   properties: {
     decision: { type: "string", enum: decisions },
     summary: { type: "string" },
-    handoff: { type: ["string", "null"] },
     prNumber: { type: ["integer", "null"], minimum: 1 },
     issueIds: { type: ["array", "null"], items: { type: "string" } },
   },
-  required: ["decision", "summary", "handoff", "prNumber", "issueIds"],
+  required: ["decision", "summary", "prNumber", "issueIds"],
   additionalProperties: false,
 };
 
@@ -75,7 +75,6 @@ function parseResult(text: string): AgentResult {
   if (
     !decisions.includes(String(value.decision)) ||
     typeof value.summary !== "string" ||
-    (value.handoff != null && typeof value.handoff !== "string") ||
     (value.prNumber != null &&
       (!Number.isInteger(value.prNumber) || Number(value.prNumber) < 1)) ||
     (value.issueIds != null &&
@@ -87,7 +86,6 @@ function parseResult(text: string): AgentResult {
   return {
     decision: value.decision as AgentResult["decision"],
     summary: value.summary,
-    ...(value.handoff == null ? {} : { handoff: value.handoff as string }),
     ...(value.prNumber == null ? {} : { prNumber: value.prNumber as number }),
     ...(value.issueIds == null ? {} : { issueIds: value.issueIds as string[] }),
   };
@@ -95,6 +93,7 @@ function parseResult(text: string): AgentResult {
 
 interface ActiveRun {
   threadId: string;
+  outputFormat: "text" | "json";
   turnId?: string;
   messages: Map<string, { text: string; phase?: string }>;
   completion: Promise<RunResult>;
@@ -251,6 +250,7 @@ export class CodexRunner {
           approvalPolicy: "on-request",
           approvalsReviewer: "auto_review",
           ...(input.model ? { model: input.model } : {}),
+          ...(input.config ? { config: input.config } : {}),
           ...(input.developerInstructions
             ? { developerInstructions: input.developerInstructions }
             : {}),
@@ -279,6 +279,7 @@ export class CodexRunner {
       });
       active = {
         threadId,
+        outputFormat: input.outputFormat ?? "json",
         messages: new Map(),
         completion,
         resolve,
@@ -305,10 +306,13 @@ export class CodexRunner {
             excludeTmpdirEnvVar: false,
             excludeSlashTmp: false,
           },
-          input: [{ type: "text", text: input.prompt }],
+          input: [
+            { type: "text", text: input.prompt },
+            ...(input.skills ?? []).map((skill) => ({ type: "skill", ...skill })),
+          ],
           ...(input.model ? { model: input.model } : {}),
           ...(input.reasoning ? { effort: input.reasoning } : {}),
-          outputSchema,
+          ...(current.outputFormat === "json" ? { outputSchema } : {}),
         }),
       );
       const turn = object(response.turn);
@@ -493,11 +497,17 @@ export class CodexRunner {
       messages.findLast((item) => item.phase === undefined);
     try {
       if (!final)
-        throw new Error("Codex completed without a structured result");
+        throw new Error(
+          run.outputFormat === "text"
+            ? "Codex completed without a final message"
+            : "Codex completed without a structured result",
+        );
       this.finish(run, {
         threadId: run.threadId,
         outcome: "completed",
-        result: parseResult(final.text),
+        ...(run.outputFormat === "text"
+          ? { text: final.text }
+          : { result: parseResult(final.text) }),
       });
     } catch (error) {
       this.finish(run, {

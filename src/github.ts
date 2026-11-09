@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { realpathSync } from "node:fs";
-import { lstat, mkdir } from "node:fs/promises";
+import { appendFile, lstat, mkdir, readFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 
 export type CheckStatus = "pending" | "success" | "failure" | "unknown";
@@ -86,6 +86,12 @@ interface WorkflowRun {
   conclusion: string;
   headSha: string;
   url: string;
+}
+
+interface WorkflowDefinition {
+  name: string;
+  path: string;
+  state: string;
 }
 
 interface Ownership {
@@ -207,7 +213,7 @@ export class GitHub {
     return this.command("gh", [...args, "--repo", this.repo.github]);
   }
 
-  private async fetchTarget(): Promise<string> {
+  async targetCommit(): Promise<string> {
     await this.command("git", [
       "check-ref-format",
       `refs/heads/${this.repo.branch}`,
@@ -287,7 +293,7 @@ export class GitHub {
       );
     const branch = `symphony/${issue}`;
     const path = this.workspacePath(branch);
-    const baseline = await this.fetchTarget();
+    const baseline = await this.targetCommit();
     const owner = await this.ownership(branch);
     const head = await this.localHead(branch);
     const worktree = (await this.worktrees()).find(
@@ -312,6 +318,28 @@ export class GitHub {
       );
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (
+      this.repo.worktreeRoot === resolve(this.repo.path, ".symphony/worktrees")
+    ) {
+      // Keep nested runtime worktrees out of the shared checkout's Git status.
+      const exclude = resolve(
+        this.repo.path,
+        await this.command("git", ["rev-parse", "--git-path", "info/exclude"]),
+      );
+      let contents = "";
+      try {
+        contents = await readFile(exclude, "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      if (!contents.split(/\r?\n/).includes("/.symphony/")) {
+        await mkdir(dirname(exclude), { recursive: true });
+        await appendFile(
+          exclude,
+          `${contents && !contents.endsWith("\n") ? "\n" : ""}/.symphony/\n`,
+        );
+      }
     }
     await mkdir(this.repo.worktreeRoot, { recursive: true });
     const metadata: Ownership = owner ?? { repo: this.repo.id, path, baseline };
@@ -367,12 +395,55 @@ export class GitHub {
     return pr ? toPr(pr) : null;
   }
 
+  async validateWorkflows(): Promise<void> {
+    const required = this.repo.requiredWorkflows ?? [];
+    if (!required.length) return;
+    const workflows = JSON.parse(
+      await this.gh([
+        "workflow",
+        "list",
+        "--all",
+        "--limit",
+        "1000",
+        "--json",
+        "name,path,state",
+      ]),
+    ) as WorkflowDefinition[];
+    const problems: string[] = [];
+    for (const configured of required) {
+      const workflow = workflows.find(
+        (candidate) =>
+          configured === candidate.name ||
+          configured === candidate.path ||
+          configured === basename(candidate.path),
+      );
+      if (!workflow)
+        problems.push(`${JSON.stringify(configured)} does not exist`);
+      else if (workflow.state !== "active") {
+        problems.push(`${JSON.stringify(configured)} is ${workflow.state}`);
+      }
+    }
+    if (problems.length) {
+      const available =
+        workflows
+          .map(
+            (workflow) =>
+              `${workflow.name} (${workflow.path}, ${workflow.state})`,
+          )
+          .join("; ") || "none";
+      throw new Error(
+        `Invalid required_workflows for ${this.repo.github}: ${problems.join("; ")}. ` +
+          `Available workflows: ${available}. Configure an existing active CI workflow name or path.`,
+      );
+    }
+  }
+
   async masterHealth(): Promise<{
     sha: string;
     status: CheckStatus;
     url?: string;
   }> {
-    const sha = await this.fetchTarget();
+    const sha = await this.targetCommit();
     const workflows = this.repo.requiredWorkflows;
     let runs: WorkflowRun[];
     let missing = false;

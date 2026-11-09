@@ -163,7 +163,18 @@ async function fixture(
       json(response, { jsonrpc: "2.0", id: message.id, result });
     })().catch((error) => json(response, { error: String(error) }, 500));
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        server.off("error", reject);
+        resolve();
+      });
+    });
+  } catch (error) {
+    await rm(authDir, { recursive: true, force: true });
+    throw error;
+  }
   const address = server.address();
   assert(address && typeof address !== "string");
   url = `http://127.0.0.1:${address.port}`;
@@ -327,6 +338,61 @@ test("paginates MCP issues and hydrates blockers and PR attachments through get_
   });
 });
 
+test("reads completion and status history through advertised get_issue fields", async (t) => {
+  const tools = standardTools().map((entry) =>
+    entry.name === "get_issue"
+      ? tool("get_issue", ["id", "includeRelations", "fields"])
+      : entry,
+  );
+  const remote = await fixture({
+    tools,
+    call: (call) => {
+      assert.equal(call.name, "get_issue");
+      assert.ok(call.arguments.fields.includes("relations"));
+      assert.ok(call.arguments.fields.includes("completedAt"));
+      assert.ok(call.arguments.fields.includes("stateHistory"));
+      return {
+        content: [],
+        structuredContent: {
+          ...issue("3"),
+          id: "ENG-3",
+          uuid: "11111111-1111-4111-8111-111111111111",
+          identifier: undefined,
+          status: "Done",
+          startedAt: "2026-11-01T00:00:00Z",
+          completedAt: "2026-11-09T00:00:00Z",
+          stateHistory: [
+            {
+              state: { name: "Blocked" },
+              startedAt: "2026-11-02T00:00:00Z",
+              endedAt: "2026-11-03T00:00:00Z",
+            },
+            {
+              state: { name: "Done" },
+              startedAt: "2026-11-09T00:00:00Z",
+              endedAt: null,
+            },
+          ],
+        },
+      };
+    },
+  });
+  t.after(() => remote.close());
+  await remote.seedAuth();
+  const client = new LinearClient(remote);
+  t.after(() => client.close());
+  await client.connect();
+  const data = await client.getIssue("3");
+  assert.equal(data.id, "11111111-1111-4111-8111-111111111111");
+  assert.equal(data.identifier, "ENG-3");
+  assert.equal(data.completedAt, "2026-11-09T00:00:00Z");
+  assert.equal(data.startedAt, "2026-11-01T00:00:00Z");
+  assert.deepEqual(data.stateHistory, [
+    { state: "Blocked", startedAt: "2026-11-02T00:00:00Z" },
+    { state: "Done", startedAt: "2026-11-09T00:00:00Z" },
+  ]);
+});
+
 test("uses advertised save_issue/save_comment schemas for writes", async (t) => {
   const remote = await fixture({
     call: (call) => ({
@@ -374,6 +440,54 @@ test("uses advertised save_issue/save_comment schemas for writes", async (t) => 
         labels: ["symphony"],
       },
     },
+  ]);
+});
+
+test("maps hosted MCP id/uuid fields and resolves minimal blocker relations", async (t) => {
+  const issueUuid = "11111111-1111-4111-8111-111111111111";
+  const blockerUuid = "22222222-2222-4222-8222-222222222222";
+  const remote = await fixture({
+    call: (call) => {
+      if (call.name === "list_issues")
+        return {
+          content: [],
+          structuredContent: {
+            issues: [{ id: "ENG-101", uuid: issueUuid, title: "Current issue" }],
+            hasNextPage: false,
+          },
+        };
+      assert.equal(call.name, "get_issue");
+      if (call.arguments.id === "ENG-100") {
+        assert.deepEqual(call.arguments, { id: "ENG-100" });
+        return {
+          content: [],
+          structuredContent: {
+            id: "ENG-100",
+            uuid: blockerUuid,
+            title: "Blocking issue",
+            status: "Canceled",
+          },
+        };
+      }
+      assert.equal(call.arguments.id, "ENG-101");
+      const data = issue("101");
+      delete data.identifier;
+      data.id = "ENG-101";
+      data.uuid = issueUuid;
+      data.relations.blockedBy = [{ id: "ENG-100", title: "Blocking issue" }];
+      return { content: [], structuredContent: data };
+    },
+  });
+  t.after(() => remote.close());
+  await remote.seedAuth();
+  const client = new LinearClient(remote);
+  t.after(() => client.close());
+  await client.connect();
+  const [data] = await client.listIssues({ team: "ENG", project: "App" });
+  assert.equal(data.id, issueUuid);
+  assert.equal(data.identifier, "ENG-101");
+  assert.deepEqual(data.blockedBy, [
+    { id: blockerUuid, identifier: "ENG-100", state: "Canceled" },
   ]);
 });
 

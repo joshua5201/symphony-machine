@@ -268,6 +268,25 @@ test("failed target CI pauses ordinary merges and permits a checked CI repair ca
   assert.equal(ordinary.pr.state, "OPEN");
 });
 
+test("no-auto-pickup excludes approved work from merge planning and a cached merge plan", async (t) => {
+  const f = setup(t);
+  const { issue } = f.candidate();
+  issue.labels = ["no-auto-pickup"];
+  await f.plan();
+  assert.equal(f.store.jobs().filter((job) => job.role === "merge").length, 0);
+  assert.deepEqual(f.updates, []);
+  assert.deepEqual(f.merges, []);
+
+  issue.labels = [];
+  await f.plan();
+  assert.equal(f.store.jobs().filter((job) => job.role === "merge").length, 1);
+  issue.labels = ["no-auto-pickup"];
+  await f.merge();
+  assert.deepEqual(f.updates, []);
+  assert.deepEqual(f.merges, []);
+  assert.deepEqual(f.linearWrites, []);
+});
+
 test("a newly failed target CI check prevents an ordinary merge", async (t) => {
   const f = setup(t);
   f.candidate();
@@ -316,7 +335,7 @@ test("updating a PR branch invalidates its review before any merge", async (t) =
   assert.equal(f.state.targetReads, 0);
 });
 
-test("a successful merge queues Done, persists cleanup work, and runs managed cleanup", async (t) => {
+test("a verified merge preserves Linear state while managed cleanup proceeds", async (t) => {
   const f = setup(t);
   const { issue, pr, execution } = f.candidate();
   await f.plan();
@@ -325,27 +344,33 @@ test("a successful merge queues Done, persists cleanup work, and runs managed cl
   assert.equal(f.store.get(`merge:${f.repo.id}:${issue.id}`), null);
   assert.equal(f.store.get(`cleanup:${execution.id}`), true);
   assert.deepEqual(f.cleanups, [], "cleanup follows the confirmed merge");
-  const outbox =
-    f.store.get<Array<{ issueId: string; state: string; comment: string }>>(
-      "outbox",
-    )!;
-  assert.equal(outbox[0].issueId, issue.id);
-  assert.equal(outbox[0].state, f.repo.states.done);
-  assert.match(
-    outbox[0].comment,
-    /Merged https:\/\/github.com\/owner\/app\/pull\/1/,
-  );
   assert.equal(
     f.store.get<{ status: string }>(`health:${f.repo.id}`)!.status,
     "pending",
   );
   await f.machine.flush();
-  assert.equal(issue.state, f.repo.states.done);
+  assert.equal(issue.state, f.repo.states.review);
   await (f.machine as any).cleanup(f.repo);
   assert.deepEqual(f.cleanups, [
     { workspace: execution.workspace, number: pr.number },
   ]);
   assert.equal(f.store.get(`cleaned:${execution.id}`), true);
+});
+
+test("a PR merged into a different target retains its workspace and Linear review state", async (t) => {
+  const f = setup(t);
+  const { issue, pr, execution } = f.candidate();
+  pr.state = "MERGED";
+  pr.base = "release";
+  await (f.machine as any).cleanup(f.repo);
+  await f.machine.flush();
+  assert.deepEqual(f.cleanups, []);
+  assert.equal(issue.state, f.repo.states.review);
+  assert.deepEqual(
+    f.store.jobs().find((job) => job.id === execution.id)!.workspace,
+    execution.workspace,
+  );
+  assert.equal(f.store.get(`cleanup:${execution.id}`), undefined);
 });
 
 test("an interrupted new review cannot leave a previous merge approval usable", async (t) => {

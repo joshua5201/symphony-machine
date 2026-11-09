@@ -12,11 +12,14 @@ import {
 import { resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { execFileSync } from "node:child_process";
-import { loadConfig } from "./config.js";
+import { loadConfig, gitConfig } from "./config.js";
+import { GitHub } from "./github.js";
 import { Store } from "./store.js";
 import { LinearClient } from "./linear.js";
 import { CodexRunner } from "./codex.js";
 import { Machine } from "./machine.js";
+import { executionSkill } from "./prompts.js";
+import { startDashboard } from "./dashboard.js";
 
 const args = process.argv.slice(2);
 const command = args[0] ?? "help";
@@ -161,11 +164,27 @@ async function main() {
     args: config.codex.args,
     onEvent: (event) => {
       // Do not persist raw prompts, tool output, auth responses or stderr.
-      const e = event as { method?: string; type?: string };
-      if (e.method === "turn/completed") log("codex_turn_completed");
+      const e = event as {
+        method?: string;
+        params?: { threadId?: string };
+      };
+      if (e.method !== "turn/completed") return;
+      const threadId = e.params?.threadId;
+      const job = threadId
+        ? store.jobs().find(
+            (j) => j.threadId === threadId || j.workerThreadId === threadId,
+          )
+        : undefined;
+      log("codex_turn_completed", {
+        job: job?.id,
+        issue: job?.identifier,
+        role: job?.role,
+        thread: threadId,
+      });
     },
   });
   let machine: Machine | undefined;
+  let dashboard: Awaited<ReturnType<typeof startDashboard>> | undefined;
   let stop = false;
   let signals = 0;
   const onSignal = () => {
@@ -186,8 +205,16 @@ async function main() {
         stdio: "ignore",
       });
       readFileSync(config.codex.workflow, "utf8");
+      readFileSync(executionSkill.path, "utf8");
+      await new GitHub(gitConfig(r)).validateWorkflows();
     }
     await linear.connect();
+    // Validate real issue shapes before any background agent can be dispatched.
+    for (const r of config.repositories) {
+      for (const state of [r.states.todo, r.states.review]) {
+        await linear.listIssues({team:r.team,project:r.project,state});
+      }
+    }
     await runner.start();
     // Check the independent agent MCP configuration, not the Desktop session.
     const servers = await runner.mcpStatus();
@@ -200,14 +227,8 @@ async function main() {
         `Codex MCP server ${config.codex.linear_mcp_server} is unavailable. Run codex mcp add/login as documented.`,
       );
     if (command === "doctor") {
-      for (const r of config.repositories)
-        await linear.listIssues({
-          team: r.team,
-          project: r.project,
-          state: r.states.todo,
-        });
       console.log(
-        "Ready: git/gh installed, Codex ChatGPT OAuth active, controller Linear MCP and Codex Linear MCP connected. No agent turn or repository mutation was started.",
+        "Ready: configured GitHub workflows verified, Todo/review issues parsed, Codex ChatGPT OAuth active, controller Linear MCP and Codex Linear MCP connected. No agent turn or repository mutation was started.",
       );
       return;
     }
@@ -215,6 +236,13 @@ async function main() {
     machine.recover();
     process.on("SIGINT", onSignal);
     process.on("SIGTERM", onSignal);
+    if (config.dashboard.enabled) {
+      const runningMachine = machine;
+      dashboard = await startDashboard(config.dashboard, () =>
+        runningMachine.dashboard(),
+      );
+      log("dashboard_listening", { url: dashboard.url });
+    }
     let mtime = statSync(file).mtimeMs;
     let reloadError = "";
     while (!stop) {
@@ -256,6 +284,7 @@ async function main() {
     } catch (error) {
       log("shutdown_sync_pending", { error: String(error) });
     }
+    await dashboard?.close();
     await linear.close();
     store.close();
     if (ownsLock) unlinkSync(lock);

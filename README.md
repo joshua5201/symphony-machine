@@ -10,7 +10,8 @@ You handle intake, issues marked `needs-human`, and Blocked work. The machine po
 - `codex login` with your ChatGPT account. Symphony uses Codex-managed OAuth; it never extracts or copies your ChatGPT tokens.
 - `gh auth login` or your existing `GH_TOKEN` environment. Git fetch/push must work non-interactively. The configured remote must refer to the configured GitHub repository.
 - Your Symphony workflow at `~/.agents/workflows/WORKFLOW.md`, or a configured alternate path.
-- A Linear project per managed repository, existing workflow states and a `needs-human` label. Use team/project IDs when names are ambiguous.
+- The original `symphony-execute` skill at `~/.agents/skills/symphony-execute/SKILL.md`.
+- A Linear project per managed repository, existing workflow states and `needs-human` and `no-auto-pickup` labels. Workspace labels can be shared across teams. Use team/project IDs when names are ambiguous.
 - Target-branch CI and repository protections appropriate to autonomous merges, including requiring the PR branch to be up to date. The runner never uses `--admin` or bypasses branch protection.
 
 The public repository contains no credentials, local configuration, database, sessions, or worktrees. Runtime data defaults to `~/.local/state/symphony-machine`; Codex uses its normal local session/auth storage.
@@ -22,7 +23,7 @@ npm ci
 cp symphony.example.yaml symphony.yaml
 ```
 
-Edit the ignored `symphony.yaml`: repository path, GitHub owner/repo, target branch (`master` or `main`), Linear team/project IDs, actual state names, and required CI workflows. No token belongs in this file. Every configured project must map to exactly one repository. This version executes code tickets with a PR; it does not publish non-code-only tickets or deployments.
+Edit the ignored `symphony.yaml`: repository path, GitHub owner/repo, target branch (`master` or `main`), Linear team/project IDs, actual state names, and required CI workflows. No token belongs in this file. Every configured project must map to exactly one repository. This version executes code tickets with a PR; it does not deliver non-code-only tickets. Lead performs any required dev/per-PR deployment within existing explicit authorization.
 
 There are two independent Linear MCP clients:
 
@@ -73,6 +74,59 @@ npm start -- retry --issue TEAM-123 --config symphony.yaml
 
 Pause stops new dispatch/merge work for the selected scope; active agents finish. Retry returns an existing failed/blocked execution to Todo (or a review-only job to review); it does not remove `needs-human`. Resolve the human decision and remove that label explicitly when appropriate. Normal resumption is also possible by moving the ticket back to Todo in Linear.
 
+Add `no-auto-pickup` to any issue you want to handle yourself. Symphony skips new execution, recovery of interrupted execution, review, merge planning and automatic merge for that issue, including CI repair and maintenance tickets. Active agents finish. Remove the label to restore normal processing according to the issue's state and dependencies; retry does not remove it. The label name is configurable with `linear.no_auto_pickup_label` and defaults to `no-auto-pickup`. `needs-human` remains the separate marker for a pending human decision or acceptance.
+
+## Read-only dashboard
+
+The foreground runner also serves a dashboard at `http://127.0.0.1:4310`. Each configured repository/project has its own tab. Desktop uses a compact Kanban board; narrow phone screens stack the same sections vertically. There are no workflow controls, login or application authentication.
+
+The board groups tickets into Todo, In Progress, Review, Blocked, Done, and other states when present. Todo includes every current project Todo ticket. Other columns include tickets with Symphony execution/review records or recorded maintenance-created issue IDs. Each ticket appears once, even when multiple agents have handled it.
+
+Cards show:
+
+- The Linear ticket link, title and Direct/Delegated routing label.
+- Separate Linear and agent statuses: an agent finishing its turn does not make the ticket Done.
+- A human-review badge when the configured `linear.needs_human_label` is present.
+- Completion time from Linear's `completedAt` and the most recent Blocked time from its status history. Missing historical times are shown as unknown, never inferred from a job's last update.
+- An expandable command for resuming the recorded agent session.
+
+The latest maintenance theme and findings appear below the board, with expandable history, including failed or interrupted rounds. Historical maintenance records without a recorded theme show a general maintenance theme. Old maintenance-created tickets without recorded issue IDs cannot be reconstructed from local history alone.
+
+The browser refreshes every five seconds from local runner state. The runner polls Todo and handled tickets at `polling.linear_seconds`, including while dispatch is paused. The board shows the Linear snapshot time and retains previous data with a stale indicator when a read fails. Ticket details remain an in-memory read-only projection: Linear owns ticket state and labels; SQLite retains execution/recovery references. Viewing the dashboard does not dispatch an agent or modify Linear/GitHub.
+
+### Manual session handoff
+
+Expand a ticket's session section to copy its `codex resume` command. The command includes the configured repository directory and retained execution worktree when applicable. Copying never runs the command or interrupts an agent. If clipboard access is unavailable over plain LAN HTTP, the text is selected for manual copying.
+
+Check the separate agent status before taking over; do not drive a currently active thread from both clients. Session IDs and local paths in these commands come from private runtime state, not committed configuration.
+
+### Local access and configuration
+
+Put actual bind settings in the gitignored `symphony.yaml`:
+
+```yaml
+dashboard:
+  enabled: true
+  host: 127.0.0.1
+  port: 4310
+```
+
+| Access | Configuration |
+| --- | --- |
+| This machine | Keep `host: 127.0.0.1`. |
+| Direct LAN | Set `host: 0.0.0.0` for all IPv4 interfaces, or use a local interface address in private configuration. |
+| Tailnet | Keep the loopback default and forward it with Tailscale Serve. |
+
+Anyone who can reach the listener can read the dashboard. Set `enabled: false` to disable it. Bind changes and server code are loaded on the next runner start; editing or publishing source does not restart the running process. The listener closes with that process.
+
+For [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve):
+
+```bash
+tailscale serve --bg http://127.0.0.1:4310
+```
+
+Use the address returned by Tailscale. Serve is configured separately; Symphony does not launch a Tailscale child process. Keep personal IPs, hostnames, tailnet domains, repository paths, project IDs and credentials out of tracked source/examples. Use local configuration and existing login stores; do not commit screenshots or runtime data.
+
 ## Default schedule and capacity
 
 | Work                                             | Default    |
@@ -82,14 +136,24 @@ Pause stops new dispatch/merge work for the selected scope; active agents finish
 | PR/CI/merge/cleanup tracking                     | 30 seconds |
 | Target branch CI                                 | 60 seconds |
 | Maintenance scan                                 | 24 hours   |
-| Concurrent execution tickets                     | 3          |
-| Concurrent review/merge-planning agents combined | 1          |
-| Concurrent maintenance scans                     | 1          |
+| Concurrent execution tickets per repository      | 3          |
+| Concurrent review/merge-planning agents per repository combined | 1 |
+| Concurrent maintenance scans per repository      | 1          |
 | Concurrent merge operations per repository       | 1          |
 
-Polling is code, not an LLM turn. Unchanged completed reviews are not repeated. A maintenance scan starts when due (including first startup), and by default only when an execution slot is free and no review is running. Existing scan work is not interrupted when new product work arrives. Maintenance tickets use the normal execution pool, behind product work; CI repair tickets come first.
+Configure `concurrency.execution_tickets`, `concurrency.reviews` and `concurrency.maintenance_scans` inside each `repositories` entry. Each repository has its own limits, defaulting to 3/1/1. There is no global concurrency cap: work in one repository does not consume another repository's capacity. Review and merge-planning agents share their repository's review capacity. Repository concurrency changes reload without interrupting active jobs.
 
-Delegated execution uses a Lead plan turn, a separate Implementation thread, then resumes Lead for verification/publication. Lead waits while Implementation runs, so there is one active model turn per execution ticket. Direct mode uses only Lead. Models/reasoning are configurable; ticket label overrides use the existing `Lead model/…`, `Lead reasoning/…`, `Implementation model/…`, `Implementation reasoning/…`, and `Symphony mode/Direct` names. Unsupported settings fail visibly rather than silently changing models.
+Polling is code, not an LLM turn. Unchanged completed reviews are not repeated. A maintenance round starts when due (including first startup), and by default only when an execution slot is free and no review or merge is running in that repository. Each round selects one direction in round-robin order: unnecessary abstractions, excessive defenses/fallbacks, duplicate implementations, incomplete replacements, redundant state, ineffective validation, and documentation drift. These are investigation hypotheses, not automatic reasons to refactor. Existing scan work is not interrupted when new product work arrives. Maintenance tickets use their repository's normal execution pool, behind product work; CI repair tickets come first.
+
+Each repository/direction has its own successful commit checkpoint, retained in SQLite job history. Its first scan examines the current target snapshot for that direction; subsequent scans start from that direction's last successful commit and follow related context from the diff. The runner fetches and pins the target SHA before launching the agent. An unchanged SHA skips the agent and advances the rotation. Only a completed investigation advances the commit checkpoint; failed/incomplete rounds yield to the next direction without losing their unscanned range. Interrupted rounds resume the same direction, pinned commits and conversation. At the default interval, each direction gets a turn every seven days. Missing Git history or an incomplete investigation must be reported, not treated as a successful scan.
+
+Maintenance chooses whether to delegate after a lightweight scope overview. Broad scans should use read-only subagents split by module or concern, all investigating the same direction and pinned commit range. Small, cohesive scans can run directly. Subagents return concise evidence and coverage reports; only the parent verifies/deduplicates findings and creates tickets. All assigned scopes must finish before the checkpoint advances. Delegation uses the configured maintenance model/reasoning (subject to explicit repository overrides) and the runtime's available concurrency; subagents do not delegate further. `maintenance_scans` limits coordinator-level rounds, not their internal subagent count. This is a prompt-level delegation policy and requires subagent tools in the Codex runtime.
+
+Each execution directly invokes the original `$symphony-execute` skill, including its native app-server skill input. The short prompt supplies the ticket, headless context and isolated worktree location. The original skill and repository workflow own planning, design, Direct/delegated routing, implementation, delegation, verification, corrections and complete delivery through In Review. Lead maintains the issue state, workpad and evidence. The launcher supplies model settings and native subagent defaults; the skill resolves ticket/repository overrides. YAML does not select a global mode.
+
+Lead returns ordinary text, with no execution-specific JSON result format. The runner records the conversation, observes the latest Linear state and discovers the branch's PR for review/cleanup; it does not rewrite Lead's delivery state or add a duplicate delivery comment. The new review/merge and maintenance agents retain their structured results. Linked PR merges transition issues to Done through the existing Linear–GitHub automation; neither the runner nor its agents writes Done.
+
+Sessions start at each configured repository root so their project context uses that repository, while ticket code changes and project checks run in an isolated worktree. Worktrees default to `<repository>/.symphony/worktrees/<issue>`; the runner locally excludes `.symphony/` from Git without changing the repository's tracked ignore rules. `worktree_root` can explicitly override the location. Existing saved workspaces are preserved on recovery. Codex clients control how existing conversations appear; changing the default does not rename or remove old project entries.
 
 ## Workflow and ownership
 
@@ -105,9 +169,10 @@ The configured shared workflow, repository AGENTS.md, and WORKFLOW-OVERRIDE.md a
 - Todo is authorized for execution. Missing product decisions become Blocked.
 - Review is autonomous unless the ticket or repository explicitly requires a human decision/acceptance.
 - Agents may commit, push, and publish PRs. Only the controller merges and cleans up.
-- Agents maintain workpads/findings; the controller owns states and `needs-human` labels.
-- Maintenance intake may create Todo work within its configured policy; other proposals stay Backlog.
-- No automatic deployment or revert is granted.
+- Execution invokes the original skill. Lead owns delivery, its Linear states and workpad under the existing shared/repo-local workflow, including applicable CI, deployment and browser/emulator verification. The headless adaptation permits official Linear MCP in place of the Desktop plugin; it does not redefine those procedures.
+- The controller applies the new review/merge agent's decisions, including `needs-human`, changes requested and conflicts. Linear's GitHub integration owns Done after merge.
+- Maintenance intake may create Todo work only with high-confidence evidence within its configured policy; concrete proposals needing human decisions stay Backlog. Unsubstantiated suspicions remain in the scan summary.
+- No additional deployment or automatic revert authority is granted.
 
 Agent turns use workspace-write sandboxing with command networking enabled and Codex's automatic approval reviewer. Operations still requiring a manual response stop with an actionable blocker; the runner never blindly approves incoming permission requests. These are personal trusted-repository agents, not a sandbox service for untrusted users.
 
@@ -128,9 +193,9 @@ A separate merge-planning turn selects candidates and order. New commits or chan
 
 ## Target CI failure and cleanup
 
-Target CI is evaluated for the current remote target SHA, using configured workflow names/paths. Without an explicit list, observed runs are considered, but absent evidence is always unknown. A failed target pauses ordinary merges and creates a deduplicated `[CI repair]` Todo ticket. A repair candidate can pass the merge gate only with passing candidate checks and a completed review. After each merge, the next merge waits for healthy target CI. If a CI-only incident is resolved by a justified retry or external recovery, Lead may complete it without a PR only after the controller independently confirms healthy target CI; its diagnostic worktree is retained.
+Target CI is evaluated for the current remote target SHA, using configured workflow names/paths. Without an explicit list, observed runs are considered, but absent evidence is always unknown. A failed target pauses ordinary merges and creates a deduplicated `[CI repair]` Todo ticket. A repair candidate can pass the merge gate only with passing candidate checks and a completed review. After each merge, the next merge waits for healthy target CI. CI repair tickets execute through the same original skill and Lead-owned delivery process.
 
-After confirmed merge, the controller removes its owned worktree, local branch, and remote branch. It does not wait for target CI to turn green; later CI repairs get a fresh ticket/worktree. Cleanup:
+After a confirmed merge into the configured target, the controller removes its owned worktree, local branch, and remote branch. Cleanup does not depend on Linear's Done sync having arrived, and never sets Done itself. If a saved execution has no PR number yet, the runner discovers its branch's PR. It does not wait for target CI to turn green; later CI repairs get a fresh ticket/worktree. Cleanup:
 
 - waits until no agent for that issue is active;
 - verifies machine ownership and the configured merged target;
@@ -139,11 +204,11 @@ After confirmed merge, the controller removes its owned worktree, local branch, 
 - supports squash merge and an untouched local branch behind GitHub's update-branch commit;
 - retries failures and comments once per distinct failure, retaining execution history.
 
-CI repairs and maintenance tickets share the same execution/review/merge path. Repeated scan findings are deduplicated by the maintenance agent against existing Linear work; its policy and open-ticket cap are explicit in the prompt. This is a personal agent workflow, not an external enforcement service.
+CI repairs and maintenance tickets share the same execution/review/merge path. Maintenance's high-confidence gate requires concrete locations and a real cost or defect, investigation of the original design rationale, a bounded change preserving required behavior, and a specific verification plan. Model confidence percentages or generic best practices do not qualify. The maintenance agent evaluates this evidence and deduplicates against existing Linear work, including rejected/closed proposals; confidence, policy and the open-ticket cap are prompt-level requirements, not an independent programmatic proof. A zero-finding round is successful. An incomplete investigation or insufficient ticket capacity must not advance its checkpoint. This is a personal agent workflow, not an external enforcement service.
 
 ## Sessions, logs, and recovery
 
-Codex manages persisted conversations. The runner saves thread IDs for Lead, Implementation, Review, merge planning and maintenance. Use `status` to find them. Runtime metadata is written to `events.jsonl`; raw tool output and authentication responses are not copied into that log.
+Codex manages persisted conversations, including Lead's native subagents. The runner saves its Lead, Review, merge-planning and maintenance thread IDs; historical Implementation IDs/reports remain available for recovery of older runs. Use `status` to find them. Runtime metadata is written to `events.jsonl`; raw tool output and authentication responses are not copied into that log.
 
 Tested on the development machine: an independent app-server thread with the project root as `cwd` automatically appeared in the existing Desktop project, and Desktop could read its completed messages. It did not need to attach to Desktop's app-server. This demonstrates conversation discovery, not guaranteed concurrent control of a turn owned by another process. Do not drive the same active thread from both clients. Worktree grouping and mobile behavior are client behavior and are not prerequisites for the runner.
 

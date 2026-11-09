@@ -25,6 +25,9 @@ export interface LinearIssue {
   url: string;
   labels: string[];
   updatedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  stateHistory?: Array<{ state: string; startedAt: string }>;
   blockedBy: Array<{ id: string; identifier: string; state: string }>;
   prUrls: string[];
 }
@@ -432,11 +435,33 @@ export class LinearClient {
   }
 
   async getIssue(id: string): Promise<LinearIssue> {
-    const raw = await this.call(this.tool(["get_issue"]), {
+    const tool = this.tool(["get_issue"]);
+    const raw = await this.call(tool, {
       id,
       includeRelations: true,
+      ...("fields" in (tool.inputSchema.properties ?? {})
+        ? {
+            fields: [
+              "id",
+              "uuid",
+              "title",
+              "description",
+              "status",
+              "url",
+              "labels",
+              "updatedAt",
+              "relations",
+              "attachments",
+              "startedAt",
+              "completedAt",
+              "stateHistory",
+            ],
+          }
+        : {}),
     });
-    const issue = normalizeIssue(raw);
+    const issue = await normalizeIssue(raw, (blockerId) =>
+      this.call(this.tool(["get_issue"]), { id: blockerId }),
+    );
     const comments = this.tools.get("list_comments");
     if (comments) {
       const properties = comments.inputSchema.properties ?? {};
@@ -534,7 +559,22 @@ function stateName(value: ObjectValue): string {
     return state.name;
   throw new Error("Linear issue is missing its state.");
 }
-function normalizeIssue(value: unknown): LinearIssue {
+function issueIdentity(issue: ObjectValue): { id: string; identifier: string } {
+  // The hosted MCP uses the human identifier as `id` and exposes the stable ID as `uuid`.
+  if (typeof issue.uuid === "string" && issue.uuid)
+    return {
+      id: requiredString(issue, "uuid"),
+      identifier: requiredString(issue, "id"),
+    };
+  return {
+    id: requiredString(issue, "id"),
+    identifier: requiredString(issue, "identifier"),
+  };
+}
+async function normalizeIssue(
+  value: unknown,
+  loadBlocker: (id: string) => Promise<unknown>,
+): Promise<LinearIssue> {
   const raw = asObject(value, "issue");
   const issue = isObject(raw.issue) ? raw.issue : raw;
   const relations = asObject(
@@ -543,6 +583,23 @@ function normalizeIssue(value: unknown): LinearIssue {
   );
   if (!Array.isArray(relations.blockedBy))
     throw new Error("Linear get_issue returned no blockedBy relations.");
+  const blockedBy: LinearIssue["blockedBy"] = [];
+  for (const value of relations.blockedBy) {
+    let blocker = asObject(value, "blocking issue");
+    if (
+      !("uuid" in blocker || "identifier" in blocker) ||
+      !("status" in blocker || "state" in blocker)
+    ) {
+      // Hosted relations contain only {id, title}. Read that issue directly, without
+      // recursively expanding its relations, to obtain a stable ID and current state.
+      const raw = asObject(
+        await loadBlocker(requiredString(blocker, "id")),
+        "blocking issue",
+      );
+      blocker = isObject(raw.issue) ? raw.issue : raw;
+    }
+    blockedBy.push({ ...issueIdentity(blocker), state: stateName(blocker) });
+  }
   const description =
     typeof issue.description === "string" ? issue.description : "";
   const labels = Array.isArray(issue.labels)
@@ -562,22 +619,32 @@ function normalizeIssue(value: unknown): LinearIssue {
   }
   const prUrls = [...new Set(links.flatMap(extractPrUrls))];
   return {
-    id: requiredString(issue, "id"),
-    identifier: requiredString(issue, "identifier"),
+    ...issueIdentity(issue),
     title: requiredString(issue, "title"),
     description,
     state: stateName(issue),
     url: requiredString(issue, "url"),
     labels,
     updatedAt: requiredString(issue, "updatedAt"),
-    blockedBy: relations.blockedBy.map((value) => {
-      const blocker = asObject(value, "blocking issue");
-      return {
-        id: requiredString(blocker, "id"),
-        identifier: requiredString(blocker, "identifier"),
-        state: stateName(blocker),
-      };
-    }),
+    ...(typeof issue.startedAt === "string"
+      ? { startedAt: issue.startedAt }
+      : {}),
+    ...(typeof issue.completedAt === "string"
+      ? { completedAt: issue.completedAt }
+      : {}),
+    ...(Array.isArray(issue.stateHistory)
+      ? {
+          stateHistory: issue.stateHistory.flatMap((entry: unknown) =>
+            isObject(entry) &&
+            isObject(entry.state) &&
+            typeof entry.state.name === "string" &&
+            typeof entry.startedAt === "string"
+              ? [{ state: entry.state.name, startedAt: entry.startedAt }]
+              : [],
+          ),
+        }
+      : {}),
+    blockedBy,
     prUrls,
   };
 }

@@ -1,0 +1,72 @@
+import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { gitConfig, loadConfig } from "../src/config.js";
+
+test("worktrees default inside each repository while explicit roots retain config-relative resolution", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "symphony-config-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const configPath = join(directory, "config.json");
+  const explicitRoot = join(directory, "external-worktrees");
+  await writeFile(
+    configPath,
+    JSON.stringify({
+      data_dir: "runtime-data",
+      repositories: [
+        {
+          id: "default",
+          path: "projects/default",
+          github: "demo/default",
+          team: "Demo",
+          project: "Default",
+        },
+        {
+          id: "relative",
+          path: "projects/relative",
+          github: "demo/relative",
+          team: "Demo",
+          project: "Relative",
+          worktree_root: "custom-worktrees",
+          concurrency: { execution_tickets: 1, reviews: 2 },
+        },
+        {
+          id: "absolute",
+          path: "projects/absolute",
+          github: "demo/absolute",
+          team: "Demo",
+          project: "Absolute",
+          worktree_root: explicitRoot,
+          concurrency: { maintenance_scans: 2 },
+        },
+      ],
+    }),
+  );
+  const config = loadConfig(configPath);
+  const [defaultRepo, relativeRepo, absoluteRepo] = config.repositories;
+  assert.equal(defaultRepo.path, join(directory, "projects", "default"));
+  assert.equal(
+    defaultRepo.worktree_root,
+    join(defaultRepo.path, ".symphony", "worktrees"),
+  );
+  assert.equal(gitConfig(defaultRepo).worktreeRoot, defaultRepo.worktree_root);
+  assert.equal(relativeRepo.worktree_root, join(directory, "custom-worktrees"));
+  assert.equal(absoluteRepo.worktree_root, explicitRoot);
+  assert.equal(config.data_dir, join(directory, "runtime-data"));
+  assert.deepEqual(defaultRepo.concurrency, {
+    execution_tickets: 3,
+    reviews: 1,
+    maintenance_scans: 1,
+  });
+  assert.deepEqual(relativeRepo.concurrency, {
+    execution_tickets: 1,
+    reviews: 2,
+    maintenance_scans: 1,
+  });
+  assert.deepEqual(absoluteRepo.concurrency, {
+    execution_tickets: 3,
+    reviews: 1,
+    maintenance_scans: 2,
+  });
+});
