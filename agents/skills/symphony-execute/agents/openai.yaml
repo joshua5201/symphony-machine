@@ -1,0 +1,6 @@
+interface:
+  display_name: "Symphony Execute"
+  short_description: "明確啟用 Symphony，以 Lead 依共用流程執行及交付工作"
+  default_prompt: "使用 $symphony-execute 依共用 workflow 完成指定 Linear ticket。"
+policy:
+  allow_implicit_invocation: false

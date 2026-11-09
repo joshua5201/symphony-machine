@@ -9,8 +9,7 @@ You handle intake, issues marked `needs-human`, and Blocked work. The machine po
 - Node.js 24+, npm, Git, GitHub CLI, and a current Codex CLI supporting `app-server` and automatic approval review. Protocol tested with Codex CLI 0.167.0.
 - `codex login` with your ChatGPT account. Symphony uses Codex-managed OAuth; it never extracts or copies your ChatGPT tokens.
 - `gh auth login` or your existing `GH_TOKEN` environment. Git fetch/push must work non-interactively. The configured remote must refer to the configured GitHub repository.
-- Your Symphony workflow at `~/.agents/workflows/WORKFLOW.md`, or a configured alternate path.
-- The original `symphony-execute` skill at `~/.agents/skills/symphony-execute/SKILL.md`.
+- The workflow and skills included in this repository, installed using the command below.
 - A Linear project per managed repository, existing workflow states and `needs-human` and `no-auto-pickup` labels. Workspace labels can be shared across teams. Use team/project IDs when names are ambiguous.
 - Target-branch CI and repository protections appropriate to autonomous merges, including requiring the PR branch to be up to date. The runner never uses `--admin` or bypasses branch protection.
 
@@ -20,8 +19,23 @@ The public repository contains no credentials, local configuration, database, se
 
 ```bash
 npm ci
+npm run install:agents -- --dry-run
+npm run install:agents
 cp symphony.example.yaml symphony.yaml
 ```
+
+The agent installer links each of `symphony-intake` and `symphony-execute` individually under `~/.agents/skills`. It also links `WORKFLOW.md` and `LINEAR-CONTRACT.md` individually under `~/.agents/workflows`. The parent directories remain real directories, so other skills and workflows can coexist. All destinations are checked before changes; repeat installation keeps correct links and refuses conflicting content.
+
+The same Node script runs on macOS, Linux, and Windows, with an optional home-directory argument:
+
+```sh
+node scripts/install-agent-assets.mjs --dry-run /path/to/home
+node scripts/install-agent-assets.mjs /path/to/home
+```
+
+On Windows, skill directories use junctions and Markdown files use symbolic links. Enable Windows Developer Mode or run with symbolic-link privileges for those file links. Keep the checkout at a stable path: installed links follow its current contents, including branch changes. The installer does not configure Codex, logins, plugins, or services. Installing the skills does not require starting the runner. Start a fresh agent session to discover newly installed skills.
+
+For an existing installation where `~/.agents` is a whole-directory link into dotfiles, first inspect its target and preserve any unrelated assets, then replace that link with a real directory and run this installer. The installer refuses linked parent directories so it cannot write into the old repository. Dotfiles now manages only global agent instructions and its other environment helpers; it is not a Symphony dependency.
 
 Edit the ignored `symphony.yaml`: repository path, GitHub owner/repo, target branch (`master` or `main`), Linear team/project IDs, actual state names, and required CI workflows. No token belongs in this file. Every configured project must map to exactly one repository. This version executes code tickets with a PR; it does not deliver non-code-only tickets. Lead performs any required dev/per-PR deployment within existing explicit authorization.
 
@@ -149,36 +163,25 @@ Each repository/direction has its own successful commit checkpoint, retained in 
 
 Maintenance chooses whether to delegate after a lightweight scope overview. Broad scans should use read-only subagents split by module or concern, all investigating the same direction and pinned commit range. Small, cohesive scans can run directly. Subagents return concise evidence and coverage reports; only the parent verifies/deduplicates findings and creates tickets. All assigned scopes must finish before the checkpoint advances. Delegation uses the configured maintenance model/reasoning (subject to explicit repository overrides) and the runtime's available concurrency; subagents do not delegate further. `maintenance_scans` limits coordinator-level rounds, not their internal subagent count. This is a prompt-level delegation policy and requires subagent tools in the Codex runtime.
 
-Each execution directly invokes the original `$symphony-execute` skill, including its native app-server skill input. The short prompt supplies the ticket, headless context and isolated worktree location. The original skill and repository workflow own planning, design, Direct/delegated routing, implementation, delegation, verification, corrections and complete delivery through In Review. Lead maintains the issue state, workpad and evidence. The launcher supplies model settings and native subagent defaults; the skill resolves ticket/repository overrides. YAML does not select a global mode.
+Each execution invokes the bundled [`symphony-execute`](agents/skills/symphony-execute/SKILL.md) skill with its native app-server skill input, ticket, headless context, isolated worktree and configured Linear state mapping. The [Chinese workflow](agents/workflows/WORKFLOW.md) owns the development procedure.
 
 Lead returns ordinary text, with no execution-specific JSON result format. The runner records the conversation, observes the latest Linear state and discovers the branch's PR for review/cleanup; it does not rewrite Lead's delivery state or add a duplicate delivery comment. The new review/merge and maintenance agents retain their structured results. Linked PR merges transition issues to Done through the existing Linear–GitHub automation; neither the runner nor its agents writes Done.
 
 Sessions start at each configured repository root so their project context uses that repository, while ticket code changes and project checks run in an isolated worktree. Worktrees default to `<repository>/.symphony/worktrees/<issue>`; the runner locally excludes `.symphony/` from Git without changing the repository's tracked ignore rules. `worktree_root` can explicitly override the location. Existing saved workspaces are preserved on recovery. Codex clients control how existing conversations appear; changing the default does not rename or remove old project entries.
 
-## Workflow and ownership
+## Workflow and Linear interface
 
-| Source     | Authority                                                                              |
-| ---------- | -------------------------------------------------------------------------------------- |
-| Linear     | Requirements, states, dependencies, human decisions, workpad                           |
-| Git/GitHub | Commits, PR state, CI, confirmed merges                                                |
-| SQLite     | Agent runs, thread IDs, worktrees, review decisions, recovery, pending synchronization |
+The [Linear interface contract](agents/workflows/LINEAR-CONTRACT.md) is the reference for required statuses, their meaning, control labels, dependency evidence and issue handoffs. Map its semantic state keys to the existing team states in local configuration.
 
-The configured shared workflow, repository AGENTS.md, and WORKFLOW-OVERRIDE.md are read by agents. Explicit runtime instructions extend the older interactive Symphony workflow:
+The [workflow](agents/workflows/WORKFLOW.md) is the owner's maintained Chinese implementation. It defines roles, modes, models, planning, verification and delivery procedures. The two explicit entry skills are [intake](agents/skills/symphony-intake/SKILL.md) and [execute](agents/skills/symphony-execute/SKILL.md). Installing them does not implicitly activate Symphony for unrelated work. Repository `AGENTS.md` and `WORKFLOW-OVERRIDE.md` supply applicable project rules and explicit workflow overrides; issue-specific requirements and human decisions remain in Linear.
 
-- Official Linear MCP is permitted in headless sessions; Desktop-only plugin availability is not required.
-- Todo is authorized for execution. Missing product decisions become Blocked.
-- Review is autonomous unless the ticket or repository explicitly requires a human decision/acceptance.
-- Agents may commit, push, and publish PRs. Only the controller merges and cleans up.
-- Execution invokes the original skill. Lead owns delivery, its Linear states and workpad under the existing shared/repo-local workflow, including applicable CI, deployment and browser/emulator verification. The headless adaptation permits official Linear MCP in place of the Desktop plugin; it does not redefine those procedures.
-- The controller applies the new review/merge agent's decisions, including `needs-human`, changes requested and conflicts. Linear's GitHub integration owns Done after merge.
-- Maintenance intake may create Todo work only with high-confidence evidence within its configured policy; concrete proposals needing human decisions stay Backlog. Unsubstantiated suspicions remain in the scan summary.
-- No additional deployment or automatic revert authority is granted.
+SQLite stores execution and recovery references, not a second requirements database. GitHub owns PR, CI and merge facts. The runner's headless instructions adapt Linear tool access and hand work after Review to its reviewer/coordinator without granting additional deployment authority.
 
 Agent turns use workspace-write sandboxing with command networking enabled and Codex's automatic approval reviewer. Operations still requiring a manual response stop with an actionable blocker; the runner never blindly approves incoming permission requests. These are personal trusted-repository agents, not a sandbox service for untrusted users.
 
 ## Dependencies and review
 
-A blocked-by issue must be Done and its linked PRs must actually be merged into the configured target branch. Closed/canceled PRs do not satisfy dependencies. Cross-repository dependencies work only when the other repository is configured. A Done dependency with no discoverable PR is not assumed merged: explicitly document `[No PR required]` in its description for a genuinely non-code deliverable.
+Dependency and status requirements are defined in the [Linear interface contract](agents/workflows/LINEAR-CONTRACT.md). Cross-repository dependencies must refer to configured repositories so their PR and target-branch facts can be verified.
 
 The controller discovers PR links from attachments, descriptions, and comments, plus its own execution records. Historical or superseded PR links can hold a dependency; clarify/remove obsolete linkage rather than silently guessing which PR counts. Normal dependency waiting remains Todo and consumes no agent slot.
 
@@ -193,7 +196,7 @@ A separate merge-planning turn selects candidates and order. New commits or chan
 
 ## Target CI failure and cleanup
 
-Target CI is evaluated for the current remote target SHA, using configured workflow names/paths. Without an explicit list, observed runs are considered, but absent evidence is always unknown. A failed target pauses ordinary merges and creates a deduplicated `[CI repair]` Todo ticket. A repair candidate can pass the merge gate only with passing candidate checks and a completed review. After each merge, the next merge waits for healthy target CI. CI repair tickets execute through the same original skill and Lead-owned delivery process.
+Target CI is evaluated for the current remote target SHA, using configured workflow names/paths. Without an explicit list, observed runs are considered, but absent evidence is always unknown. A failed target pauses ordinary merges and creates a deduplicated `[CI repair]` Todo ticket. A repair candidate can pass the merge gate only with passing candidate checks and a completed review. After each merge, the next merge waits for healthy target CI. CI repair tickets execute through the bundled skill and Lead-owned delivery process.
 
 After a confirmed merge into the configured target, the controller removes its owned worktree, local branch, and remote branch. Cleanup does not depend on Linear's Done sync having arrived, and never sets Done itself. If a saved execution has no PR number yet, the runner discovers its branch's PR. It does not wait for target CI to turn green; later CI repairs get a fresh ticket/worktree. Cleanup:
 

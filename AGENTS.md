@@ -2,6 +2,7 @@
 
 A personal, foreground workflow runner. The repository is public; the runtime and credentials are private.
 
+- Keep the workflow in Chinese and explanatory documentation in English. The Linear interface contract defines statuses and issue handoffs; workflow modes, roles and procedures belong in the workflow, not a duplicate contract specification.
 - Keep the architecture single-process: TypeScript, Node 24+, SQLite, Codex app-server, Linear MCP, system git and gh.
 - Never commit credentials, OAuth stores, local configuration, logs, databases, or worktrees. Never print tokens. Use existing Codex/gh login and supported MCP OAuth flows.
 - Linear is the authority for requirements and human decisions. GitHub is the authority for PR/CI/merge facts. SQLite tracks execution and recovery, not a second requirements database.

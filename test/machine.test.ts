@@ -649,6 +649,8 @@ test("execution invokes the original skill with headless repository and worktree
     f.config.repositories[0].path,
     "current-workflow.md",
   );
+  f.config.repositories[0].states.review = "Ready for inspection";
+  f.config.repositories[0].states.blocked = "Waiting on owner";
   await f.machine.tick(1_000);
   await until(() => f.codex.runs.length === 1);
   const input = f.codex.runs[0].input;
@@ -660,6 +662,8 @@ test("execution invokes the original skill with headless repository and worktree
   assert.ok(skill);
   assert.ok(input.prompt.includes(skill.path));
   assert.ok(instructions.includes(f.config.codex.workflow));
+  assert.ok(input.prompt.includes("Ready for inspection"));
+  assert.ok(input.prompt.includes("Waiting on owner"));
   assert.ok(input.prompt.includes(f.config.repositories[0].path));
   assert.ok(input.prompt.includes(f.store.jobs()[0].workspace!.path));
   assert.ok(input.prompt.includes(f.store.jobs()[0].workspace!.branch));

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Symphony Intake"
+  short_description: "明確啟用 Symphony，互動整理 Linear 需求並交接開發"
+  default_prompt: "使用 $symphony-intake 依共用 workflow 互動整理這些需求或 Linear tickets。"
+policy:
+  allow_implicit_invocation: false
