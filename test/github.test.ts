@@ -342,6 +342,162 @@ test("PR facts conservatively distinguish missing, pending, and failed checks", 
   assert.equal((await f.github.findPr("symphony/eng-1"))?.checks, "failure");
 });
 
+function reviewContextFixture(pages: Record<string, unknown[][]>) {
+  const calls: string[][] = [];
+  const github = new GitHub(
+    {
+      id: "review",
+      path: tmpdir(),
+      github: "demo/repo",
+      branch: "main",
+      remote: "origin",
+      worktreeRoot: join(tmpdir(), "unused-review-worktrees"),
+    },
+    async (file, args) => {
+      assert.equal(file, "gh", "reading review context must not mutate Git");
+      assert.equal(args[0], "api");
+      assert.deepEqual(args.slice(2), ["--paginate", "--slurp"]);
+      calls.push(args);
+      const response = pages[args[1]];
+      assert.ok(response, `Unexpected review endpoint: ${args[1]}`);
+      return okay(JSON.stringify(response));
+    },
+  );
+  return { github, calls };
+}
+
+const reviewEndpoint = "repos/demo/repo/pulls/7/reviews?per_page=100";
+const commentEndpoint = "repos/demo/repo/issues/7/comments?per_page=100";
+const inlineEndpoint = "repos/demo/repo/pulls/7/comments?per_page=100";
+
+function reviewComment(id: number, body: string) {
+  return {
+    id,
+    user: { login: "lead", avatar_url: "not needed in review context" },
+    body,
+    html_url: `https://github.com/demo/repo/pull/7#issuecomment-${id}`,
+    created_at: "2026-11-10T01:00:00Z",
+    updated_at: "2026-11-10T01:00:00Z",
+  };
+}
+
+test("PR review context includes every page and preserves commit and reply associations", async () => {
+  const comments = Array.from({ length: 101 }, (_, index) =>
+    reviewComment(index + 1, `Discussion ${index + 1}`),
+  );
+  const pages = {
+    [reviewEndpoint]: [[{
+      id: 200,
+      user: { login: "reviewer" },
+      body: "One finding remains.",
+      html_url: "https://github.com/demo/repo/pull/7#pullrequestreview-200",
+      state: "CHANGES_REQUESTED",
+      commit_id: "reviewed-head",
+      submitted_at: "2026-11-10T01:00:00Z",
+    }]],
+    [commentEndpoint]: [comments.slice(0, 100), comments.slice(100)],
+    [inlineEndpoint]: [[{
+      ...reviewComment(300, "Finding on the previous head"),
+      user: null,
+      pull_request_review_id: 200,
+      path: "src/example.ts",
+      commit_id: "current-head",
+      original_commit_id: "reviewed-head",
+      line: null,
+      original_line: 12,
+      side: "RIGHT",
+    }], [{
+      ...reviewComment(301, "Rejected: this behavior follows the requirement."),
+      pull_request_review_id: 201,
+      in_reply_to_id: 300,
+      path: "src/example.ts",
+      commit_id: "current-head",
+      original_commit_id: "reviewed-head",
+      line: 15,
+      original_line: 12,
+      side: "RIGHT",
+    }]],
+  };
+  const { github, calls } = reviewContextFixture(pages);
+  const context = await github.reviewContext(7);
+  assert.equal(context.comments.length, 101);
+  assert.equal(context.comments.at(-1)?.body, "Discussion 101");
+  assert.equal(context.comments[0].author, "lead");
+  assert.equal(context.comments[0].updatedAt, "2026-11-10T01:00:00Z");
+  assert.equal(context.reviews[0].commitId, "reviewed-head");
+  assert.equal(context.reviews[0].state, "CHANGES_REQUESTED");
+  assert.equal(context.inlineComments[0].author, null);
+  assert.equal(context.inlineComments[0].line, null);
+  assert.equal(context.inlineComments[0].originalLine, 12);
+  assert.equal(context.inlineComments[1].inReplyToId, 300);
+  assert.equal(context.inlineComments[1].reviewId, 201);
+  assert.equal(context.inlineComments[1].originalCommitId, "reviewed-head");
+  assert.equal(context.inlineComments[1].commitId, "current-head");
+  assert.equal(context.inlineComments[1].body,
+    "Rejected: this behavior follows the requirement.");
+  assert.equal(JSON.stringify(context).includes("avatar_url"), false);
+  assert.match(context.fingerprint, /^[a-f0-9]{64}$/);
+  assert.deepEqual(new Set(calls.map((args) => args[1])),
+    new Set([reviewEndpoint, commentEndpoint, inlineEndpoint]));
+
+  // API ordering and page boundaries must not create spurious review work.
+  pages[commentEndpoint].reverse();
+  pages[inlineEndpoint].reverse();
+  assert.equal((await github.reviewContext(7)).fingerprint, context.fingerprint);
+});
+
+test("PR review fingerprint detects replies and edits without a new commit", async () => {
+  const finding = {
+    ...reviewComment(300, "Please fix this behavior."),
+    pull_request_review_id: 200,
+    path: "src/example.ts",
+    commit_id: "same-head",
+    original_commit_id: "same-head",
+  };
+  const review = {
+    id: 200,
+    user: { login: "reviewer" },
+    body: "Please address the inline finding.",
+    html_url: "https://github.com/demo/repo/pull/7#pullrequestreview-200",
+    state: "CHANGES_REQUESTED",
+    commit_id: "same-head",
+    submitted_at: "2026-11-10T01:00:00Z",
+  };
+  const pages: Record<string, unknown[][]> = {
+    [reviewEndpoint]: [[review]],
+    [commentEndpoint]: [[]],
+    [inlineEndpoint]: [[finding]],
+  };
+  const { github } = reviewContextFixture(pages);
+  let previous = (await github.reviewContext(7)).fingerprint;
+  const assertChanged = async () => {
+    const context = await github.reviewContext(7);
+    assert.notEqual(context.fingerprint, previous);
+    assert.equal(context.reviews[0].commitId, "same-head");
+    previous = context.fingerprint;
+  };
+
+  const reply = {
+    ...finding,
+    ...reviewComment(301, "Rejected because the existing requirement covers this."),
+    in_reply_to_id: 300,
+  };
+  pages[inlineEndpoint][0].push(reply);
+  await assertChanged();
+  reply.body = "Rejected: the requirement explicitly permits this case.";
+  reply.updated_at = "2026-11-10T01:05:00Z";
+  await assertChanged();
+  pages[commentEndpoint][0].push(reviewComment(400, "Ready for another review."));
+  await assertChanged();
+  // Review edits have no updated_at field in REST, so the body is hashed too.
+  review.body = "The finding is resolved.";
+  await assertChanged();
+  review.state = "DISMISSED";
+  await assertChanged();
+  pages[inlineEndpoint][0].pop();
+  await assertChanged();
+});
+
 test("merge pins the reviewed head and refuses changed heads, wrong targets, or unknown required checks", async (t) => {
   let pr = rawPr("reviewed");
   let required = okay(JSON.stringify([{ bucket: "pass" }]));

@@ -13,7 +13,14 @@ export type DashboardTicket = {
   role: "execution" | "review" | null;
   agentStatus: Job["status"] | null;
   resumeCommand: string | null;
-  column: "todo" | "in_progress" | "review" | "blocked" | "done" | "other";
+  column:
+    | "todo"
+    | "in_progress"
+    | "review"
+    | "ready_to_merge"
+    | "blocked"
+    | "done"
+    | "other";
   state: string | null;
   needsHumanReview: boolean;
   startedAt: string | null;

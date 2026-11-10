@@ -100,6 +100,7 @@ class FakeLinear {
     assert.ok(value);
     if (patch.state) value.state = patch.state;
     if (patch.labels) value.labels = patch.labels;
+    value.updatedAt = new Date(Date.parse(value.updatedAt) + 1000).toISOString();
   }
   async comment(id: string, body: string): Promise<void> {
     this.comments.push({ id, body });
@@ -138,6 +139,7 @@ class FakeGitHub {
   target = "master-sha";
   async targetCommit() { return this.target; }
   prs = new Map<number, PrInfo>();
+  reviewFingerprints = new Map<number, string>();
   prepares: string[] = [];
   cleanups: number[] = [];
   merges: number[] = [];
@@ -158,6 +160,12 @@ class FakeGitHub {
     const value = this.prs.get(number);
     assert.ok(value, `Unknown PR ${number}`);
     return structuredClone(value);
+  }
+  async reviewContext(number: number) {
+    return {
+      fingerprint: this.reviewFingerprints.get(number) ?? `context-${number}`,
+      reviews: [], comments: [], inlineComments: [],
+    };
   }
   async findPr(branch: string) {
     return (
@@ -824,7 +832,7 @@ test("merged cleanup waits until an active review for the same issue has finishe
 
 test("a merge decision made before a ticket update cannot authorize merging the unchanged PR head", async (t) => {
   const task = issue(1, {
-    state: "In Review",
+    state: "Ready to merge",
     prUrls: [pr(1).url],
     updatedAt: "2026-11-07T01:00:00Z",
   });
@@ -835,7 +843,8 @@ test("a merge decision made before a ticket update cannot authorize merging the 
     savedJob(task, "review", {
       prNumber: 1,
       head: "head-1",
-      fingerprint: `head-1:${pr(1).updatedAt}:${task.updatedAt}`,
+      reviewedHead: "head-1",
+      fingerprint: `head-1:${pr(1).updatedAt}:${task.updatedAt}:context-1`,
     }),
   );
   f.store.set("merge:demo:issue-1", {
@@ -845,6 +854,7 @@ test("a merge decision made before a ticket update cannot authorize merging the 
     summary: "Approved earlier requirements.",
     updatedAt: "2026-11-07T00:00:00Z",
     prUpdatedAt: pr(1).updatedAt,
+    reviewFingerprint: "context-1",
   });
   await f.machine.tick(1_000);
   await until(() => f.codex.runs.length === 1);
@@ -944,7 +954,7 @@ test("startup recovery resumes a review interrupted before its unchanged fingerp
 });
 
 test("merge planning shares its repository review capacity while other repositories review independently", async (t) => {
-  const candidate = issue(1, { state: "In Review", prUrls: [pr(1).url] });
+  const candidate = issue(1, { state: "Ready to merge", prUrls: [pr(1).url] });
   const waitingReview = issue(2, { state: "In Review", prUrls: [pr(2).url] });
   const otherPr = pr(3, { url: "https://github.com/demo/other/pull/3" });
   const otherReview = issue(3, {
@@ -965,7 +975,8 @@ test("merge planning shares its repository review capacity while other repositor
   f.store.save(
     savedJob(candidate, "review", {
       prNumber: 1,
-      fingerprint: `head-1:${pr(1).updatedAt}:${candidate.updatedAt}`,
+      reviewedHead: "head-1",
+      fingerprint: `head-1:${pr(1).updatedAt}:${candidate.updatedAt}:context-1`,
     }),
   );
   f.store.set("merge:demo:issue-1", {
@@ -975,6 +986,7 @@ test("merge planning shares its repository review capacity while other repositor
     summary: "Approved.",
     updatedAt: candidate.updatedAt,
     prUpdatedAt: pr(1).updatedAt,
+    reviewFingerprint: "context-1",
   });
   await f.machine.tick(1_000);
   await until(() => f.codex.runs.length === 2);
@@ -995,7 +1007,7 @@ test("merge planning shares its repository review capacity while other repositor
 });
 
 test("a pending merge planner is not duplicated on later polls when spare review capacity exists", async (t) => {
-  const candidate = issue(1, { state: "In Review", prUrls: [pr(1).url] });
+  const candidate = issue(1, { state: "Ready to merge", prUrls: [pr(1).url] });
   const f = await fixture(t, [candidate]);
   f.config.repositories[0].auto_merge = true;
   f.config.repositories[0].concurrency.reviews = 2;
@@ -1003,7 +1015,8 @@ test("a pending merge planner is not duplicated on later polls when spare review
   f.store.save(
     savedJob(candidate, "review", {
       prNumber: 1,
-      fingerprint: `head-1:${pr(1).updatedAt}:${candidate.updatedAt}`,
+      reviewedHead: "head-1",
+      fingerprint: `head-1:${pr(1).updatedAt}:${candidate.updatedAt}:context-1`,
     }),
   );
   f.store.set("merge:demo:issue-1", {
@@ -1013,6 +1026,7 @@ test("a pending merge planner is not duplicated on later polls when spare review
     summary: "Approved.",
     updatedAt: candidate.updatedAt,
     prUpdatedAt: pr(1).updatedAt,
+    reviewFingerprint: "context-1",
   });
   await f.machine.tick(1_000);
   await until(() => f.codex.runs.length === 1);
@@ -1020,6 +1034,97 @@ test("a pending merge planner is not duplicated on later polls when spare review
   assert.equal(f.codex.runs.length, 1);
   assert.equal(f.store.jobs().filter((job) => job.role === "merge").length, 1);
   assert.equal(f.codex.runs[0].input.signal?.aborted, false);
+});
+
+test("independent PR review promotes Direct delivery to the configured ready state without reviewing its own transition again", async (t) => {
+  const task = issue(1, { state: "In Review", labels: ["Symphony mode/Direct"], prUrls: [pr(1).url] });
+  const f = await fixture(t, [task]);
+  f.config.repositories[0].states.ready_to_merge = "Merge queue";
+  f.github.prs.set(1, pr(1));
+  await f.machine.tick(1_000);
+  await until(() => f.codex.runs.length === 1);
+  assert.match(f.codex.runs[0].input.prompt, /independent Code Reviewer/);
+  assert.match(f.codex.runs[0].input.prompt, /First independent PR review/);
+  assert.match(f.codex.runs[0].input.prompt, /GitHub PR/);
+  f.codex.runs[0].finish({ outcome: "completed", result: { decision: "ready_to_merge", summary: "PR review and delivery evidence passed.", prNumber: 1 } });
+  await f.machine.drain();
+  assert.equal(f.linear.issues.get(task.id)!.state, "Merge queue");
+  const permission = f.store.get<{ updatedAt: string; reviewFingerprint: string }>("merge:demo:issue-1")!;
+  assert.equal(permission.updatedAt, f.linear.issues.get(task.id)!.updatedAt);
+  assert.equal(permission.reviewFingerprint, "context-1");
+  assert.equal(f.store.jobs()[0].reviewedHead, "head-1");
+  await f.machine.tick(3_000);
+  assert.equal(f.codex.runs.length, 1);
+});
+
+test("same-head Lead PR dispositions resume incremental review after findings return Todo", async (t) => {
+  const task = issue(1, { state: "In Review", prUrls: [pr(1).url] });
+  const f = await fixture(t, [task]);
+  f.github.prs.set(1, pr(1));
+  await f.machine.tick(1_000);
+  await until(() => f.codex.runs.length === 1);
+  f.codex.runs[0].finish({ outcome: "completed", result: { decision: "needs_changes", summary: "Resolve findings in https://github.com/demo/repo/pull/1#discussion_r1", prNumber: 1 } });
+  await f.machine.drain();
+  assert.equal(f.linear.issues.get(task.id)!.state, "Todo");
+  f.github.reviewFingerprints.set(1, "lead-rejected-with-evidence");
+  f.linear.issues.get(task.id)!.state = "In Review";
+  await f.machine.tick(3_000);
+  await until(() => f.codex.runs.length === 2);
+  assert.equal(f.codex.runs[1].input.threadId, "thread-1");
+  assert.match(f.codex.runs[1].input.prompt, /Incremental re-review.*Last completed review head: head-1/);
+  assert.match(f.codex.runs[1].input.prompt, /If the head is unchanged/);
+  assert.match(f.codex.runs[1].input.prompt, /reasoned Lead disposition/);
+  f.codex.runs[1].finish({ outcome: "completed", result: { decision: "ready_to_merge", summary: "Lead disposition recorded on PR; required evidence passed.", prNumber: 1 } });
+  await f.machine.drain();
+  assert.equal(f.linear.issues.get(task.id)!.state, "Ready to merge");
+});
+
+test("pending PR CI waits in Review without dispatching an agent or marking the ticket Blocked", async (t) => {
+  const task = issue(1, { state: "In Review", prUrls: [pr(1).url] });
+  const f = await fixture(t, [task]);
+  f.github.prs.set(1, pr(1, { checks: "pending" }));
+  await f.machine.tick(1_000);
+  await f.machine.tick(3_000);
+  assert.equal(f.codex.runs.length, 0);
+  assert.equal(f.linear.issues.get(task.id)!.state, "In Review");
+  assert.deepEqual(f.linear.updates, []);
+  f.github.prs.get(1)!.checks = "success";
+  await f.machine.tick(5_000);
+  await until(() => f.codex.runs.length === 1);
+});
+
+test("required human review holds In Review and a reviewer failure does not declare an external blocker", async (t) => {
+  for (const human of [true, false]) {
+    await t.test(human ? "human review" : "technical failure", async (t) => {
+      const task = issue(1, { state: "In Review", prUrls: [pr(1).url] });
+      const f = await fixture(t, [task]);
+      f.github.prs.set(1, pr(1));
+      await f.machine.tick(1_000);
+      await until(() => f.codex.runs.length === 1);
+      f.codex.runs[0].finish(human
+        ? { outcome: "completed", result: { decision: "needs_human", summary: "Lead requires owner review of permission changes; see PR #1.", prNumber: 1 } }
+        : { outcome: "failed", error: "GitHub tool unavailable" });
+      await f.machine.drain();
+      assert.equal(f.linear.issues.get(task.id)!.state, "In Review");
+      assert.equal(f.linear.issues.get(task.id)!.labels.includes("needs-human"), human);
+      assert.equal(f.store.get("merge:demo:issue-1"), null);
+      await f.machine.tick(3_000);
+      assert.equal(f.codex.runs.length, 1);
+    });
+  }
+});
+
+test("a Ready ticket with a changed head returns to Lead instead of reviewing before delivery evidence is refreshed", async (t) => {
+  const task = issue(1, { state: "Ready to merge", prUrls: [pr(1).url] });
+  const f = await fixture(t, [task]);
+  f.github.prs.set(1, pr(1, { head: "new-head", checks: "pending" }));
+  f.store.save(savedJob(task, "review", { prNumber: 1, head: "head-1", reviewedHead: "head-1" }));
+  await f.machine.tick(1_000);
+  await f.machine.flush();
+  assert.equal(f.linear.issues.get(task.id)!.state, "Todo");
+  assert.equal(f.codex.runs.length, 0);
+  assert.match(f.linear.comments[0].body, /Lead must verify/);
+  assert.equal(f.store.jobs()[0].reviewedHead, "head-1");
 });
 
 test("a no-PR CI incident already completed in Linear is observed locally", async (t) => {

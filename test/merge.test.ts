@@ -49,6 +49,7 @@ function setup(t: TestContext) {
     targetHealth: "success" as HealthStatus,
     targetReads: 0,
     branchUpdate: "current" as "current" | "updated" | "conflict",
+    reviewFingerprint: "context-1",
     plannedOrder: [] as string[],
     runner: async (_input: unknown): Promise<any> => ({
       outcome: "completed",
@@ -72,7 +73,9 @@ function setup(t: TestContext) {
       patch: { state?: string; labels?: string[] },
     ) {
       linearWrites.push({ issueId, patch });
-      Object.assign(issues.get(issueId)!, patch);
+      const issue = issues.get(issueId)!;
+      if (patch.state) issue.state = patch.state;
+      if (patch.labels) issue.labels = patch.labels;
     },
     async comment(issueId: string, comment: string) {
       linearWrites.push({ issueId, comment });
@@ -82,6 +85,9 @@ function setup(t: TestContext) {
     async pr(number: number) {
       assert(prs.has(number), `Unknown PR ${number}`);
       return structuredClone(prs.get(number)!);
+    },
+    async reviewContext(number: number) {
+      return { fingerprint: number === 1 ? state.reviewFingerprint : `context-${number}`, reviews: [], comments: [], inlineComments: [] };
     },
     async updateBranch(number: number) {
       updates.push(number);
@@ -120,7 +126,7 @@ function setup(t: TestContext) {
       identifier: `ENG-${number}`,
       title: `Approved ${id}`,
       description: "Accepted requirements",
-      state: repo.states.review,
+      state: repo.states.ready_to_merge,
       url: `https://linear.app/example/issue/ENG-${number}`,
       labels: [],
       updatedAt: issueTime,
@@ -165,7 +171,8 @@ function setup(t: TestContext) {
       status: "done",
       prNumber: number,
       head: pr.head,
-      fingerprint: `${pr.head}:${pr.updatedAt}:${issue.updatedAt}`,
+      reviewedHead: pr.head,
+      fingerprint: `${pr.head}:${pr.updatedAt}:${issue.updatedAt}:context-${number}`,
       startedAt: issueTime,
       updatedAt: issueTime,
     };
@@ -180,6 +187,7 @@ function setup(t: TestContext) {
       summary: "Requirements verified",
       updatedAt: issue.updatedAt,
       prUpdatedAt: pr.updatedAt,
+      reviewFingerprint: `context-${number}`,
     });
     state.plannedOrder.push(id);
     store.set(`health:${repo.id}`, {
@@ -333,6 +341,24 @@ test("updating a PR branch invalidates its review before any merge", async (t) =
     undefined,
   );
   assert.equal(f.state.targetReads, 0);
+  await f.machine.flush();
+  assert.equal(issue.state, f.repo.states.todo);
+  assert.match(f.linearWrites.at(-1)!.comment!, /current-head CI/);
+  assert.equal(f.store.jobs().find((job) => job.id === review.id)!.reviewedHead, "reviewed-head-1");
+});
+
+test("a new PR discussion invalidates merge permission even when GitHub head and PR timestamps are unchanged", async (t) => {
+  const f = setup(t);
+  const { issue, pr } = f.candidate();
+  await f.plan();
+  f.state.reviewFingerprint = "new-owner-or-lead-reply";
+  await f.merge();
+  assert.deepEqual(f.updates, []);
+  assert.deepEqual(f.merges, []);
+  assert.equal(pr.head, "reviewed-head-1");
+  await f.machine.flush();
+  assert.equal(issue.state, f.repo.states.review);
+  assert.equal(f.store.get(`merge:${f.repo.id}:${issue.id}`), null);
 });
 
 test("a verified merge preserves Linear state while managed cleanup proceeds", async (t) => {
@@ -349,7 +375,7 @@ test("a verified merge preserves Linear state while managed cleanup proceeds", a
     "pending",
   );
   await f.machine.flush();
-  assert.equal(issue.state, f.repo.states.review);
+  assert.equal(issue.state, f.repo.states.ready_to_merge);
   await (f.machine as any).cleanup(f.repo);
   assert.deepEqual(f.cleanups, [
     { workspace: execution.workspace, number: pr.number },
@@ -365,7 +391,7 @@ test("a PR merged into a different target retains its workspace and Linear revie
   await (f.machine as any).cleanup(f.repo);
   await f.machine.flush();
   assert.deepEqual(f.cleanups, []);
-  assert.equal(issue.state, f.repo.states.review);
+  assert.equal(issue.state, f.repo.states.ready_to_merge);
   assert.deepEqual(
     f.store.jobs().find((job) => job.id === execution.id)!.workspace,
     execution.workspace,

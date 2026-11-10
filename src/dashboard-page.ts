@@ -63,6 +63,7 @@ export const dashboardPage: string = String.raw`<!doctype html>
     .column-heading::before { content: ""; width: 6px; height: 6px; flex-shrink: 0; border-radius: 50%; background: #8592a6; }
     .column[data-column="in_progress"] .column-heading::before { background: #537bd1; }
     .column[data-column="review"] .column-heading::before { background: #9275c4; }
+    .column[data-column="ready_to_merge"] .column-heading::before { background: #398b8e; }
     .column[data-column="blocked"] .column-heading::before { background: #bc852b; }
     .column[data-column="done"] .column-heading::before { background: #4d947b; }
     .column-title { margin: 0; font-size: 12px; font-weight: 650; }
@@ -170,6 +171,7 @@ export const dashboardPage: string = String.raw`<!doctype html>
     const statusLabels = { running: '執行中', waiting: '等待中', blocked: '受阻', done: '已完成', failed: '失敗' };
     const ticketColumns = [
       ['todo', 'Todo'], ['in_progress', '進行中'], ['review', 'Review'],
+      ['ready_to_merge', 'Ready to merge'],
       ['blocked', 'Blocked'], ['done', 'Done'], ['other', '其他']
     ];
     const dateTime = new Intl.DateTimeFormat('zh-TW', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });

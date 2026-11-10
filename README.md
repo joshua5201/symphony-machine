@@ -10,7 +10,7 @@ You handle intake, issues marked `needs-human`, and Blocked work. The machine po
 - `codex login` with your ChatGPT account. Symphony uses Codex-managed OAuth; it never extracts or copies your ChatGPT tokens.
 - `gh auth login` or your existing `GH_TOKEN` environment. Git fetch/push must work non-interactively. The configured remote must refer to the configured GitHub repository.
 - The workflow and skills included in this repository, installed using the command below.
-- A Linear project per managed repository, existing workflow states and `needs-human` and `no-auto-pickup` labels. Workspace labels can be shared across teams. Use team/project IDs when names are ambiguous.
+- A Linear project per managed repository, mapped workflow states including `ready_to_merge` (default `Ready to merge`), and `needs-human` and `no-auto-pickup` labels. Workspace labels can be shared across teams. Use team/project IDs when names are ambiguous.
 - Target-branch CI and repository protections appropriate to autonomous merges, including requiring the PR branch to be up to date. The runner never uses `--admin` or bypasses branch protection.
 
 The public repository contains no credentials, local configuration, database, sessions, or worktrees. Runtime data defaults to `~/.local/state/symphony-machine`; Codex uses its normal local session/auth storage.
@@ -94,7 +94,7 @@ Add `no-auto-pickup` to any issue you want to handle yourself. Symphony skips ne
 
 The foreground runner also serves a dashboard at `http://127.0.0.1:4310`. Each configured repository/project has its own tab. Desktop uses a compact Kanban board; narrow phone screens stack the same sections vertically. There are no workflow controls, login or application authentication.
 
-The board groups tickets into Todo, In Progress, Review, Blocked, Done, and other states when present. Todo includes every current project Todo ticket. Other columns include tickets with Symphony execution/review records or recorded maintenance-created issue IDs. Each ticket appears once, even when multiple agents have handled it.
+The board groups tickets into Todo, In Progress, In Review, Ready to merge, Blocked, Done, and other states when present. Todo includes every current project Todo ticket. Other columns include tickets with Symphony execution/review records or recorded maintenance-created issue IDs. Each ticket appears once, even when multiple agents have handled it.
 
 Cards show:
 
@@ -165,7 +165,7 @@ Maintenance chooses whether to delegate after a lightweight scope overview. Broa
 
 Each execution invokes the bundled [`symphony-execute`](agents/skills/symphony-execute/SKILL.md) skill with its native app-server skill input, ticket, headless context, isolated worktree and configured Linear state mapping. The [Chinese workflow](agents/workflows/WORKFLOW.md) owns the development procedure.
 
-Lead returns ordinary text, with no execution-specific JSON result format. The runner records the conversation, observes the latest Linear state and discovers the branch's PR for review/cleanup; it does not rewrite Lead's delivery state or add a duplicate delivery comment. The new review/merge and maintenance agents retain their structured results. Linked PR merges transition issues to Done through the existing Linear–GitHub automation; neither the runner nor its agents writes Done.
+Lead returns ordinary text, with no execution-specific JSON result format. The runner records the conversation, observes the latest Linear state and discovers the branch's PR for review/cleanup; it does not rewrite Lead's delivery state or add a duplicate delivery comment. The Code Reviewer, Merge planning and maintenance agents retain their structured results. Linked PR merges transition issues to Done through the existing Linear–GitHub automation; neither the runner nor its agents writes Done.
 
 Sessions start at each configured repository root so their project context uses that repository, while ticket code changes and project checks run in an isolated worktree. Worktrees default to `<repository>/.symphony/worktrees/<issue>`; the runner locally excludes `.symphony/` from Git without changing the repository's tracked ignore rules. `worktree_root` can explicitly override the location. Existing saved workspaces are preserved on recovery. Codex clients control how existing conversations appear; changing the default does not rename or remove old project entries.
 
@@ -175,7 +175,7 @@ The [Linear interface contract](agents/workflows/LINEAR-CONTRACT.md) is the refe
 
 The [workflow](agents/workflows/WORKFLOW.md) is the owner's maintained Chinese implementation. It defines roles, modes, models, planning, verification and delivery procedures. The two explicit entry skills are [intake](agents/skills/symphony-intake/SKILL.md) and [execute](agents/skills/symphony-execute/SKILL.md). Installing them does not implicitly activate Symphony for unrelated work. Repository `AGENTS.md` and `WORKFLOW-OVERRIDE.md` supply applicable project rules and explicit workflow overrides; issue-specific requirements and human decisions remain in Linear.
 
-SQLite stores execution and recovery references, not a second requirements database. GitHub owns PR, CI and merge facts. The runner's headless instructions adapt Linear tool access and hand work after Review to its reviewer/coordinator without granting additional deployment authority.
+SQLite stores execution and recovery references, not a second requirements database. GitHub owns PR, CI and merge facts, including detailed review findings and their disposition. Linear holds requirements, human decisions, states, evidence links and concise handoffs. The runner's headless instructions adapt Linear tool access and hand work after In Review to an independent Code Reviewer, then Merge planning and the TypeScript coordinator, without granting additional deployment authority.
 
 Agent turns use workspace-write sandboxing with command networking enabled and Codex's automatic approval reviewer. Operations still requiring a manual response stop with an actionable blocker; the runner never blindly approves incoming permission requests. These are personal trusted-repository agents, not a sandbox service for untrusted users.
 
@@ -185,14 +185,22 @@ Dependency and status requirements are defined in the [Linear interface contract
 
 The controller discovers PR links from attachments, descriptions, and comments, plus its own execution records. Historical or superseded PR links can hold a dependency; clarify/remove obsolete linkage rather than silently guessing which PR counts. Normal dependency waiting remains Todo and consumes no agent slot.
 
+The normal path is Todo → In Progress → In Review → Ready to merge → Done. Lead owns implementation, ordinary self-checks and evidence for the current PR head, including required local checks, CI/CD and smoke tests. The formal Code Reviewer is independent of implementation even in Direct mode. Lead decides whether human code review is required under the [workflow's risk policy](agents/workflows/WORKFLOW.md#人類-code-review-政策), records why on the PR with a workpad link, and identifies what the owner must inspect. A missing assessment returns Todo for Lead to supply it. This is an explicit personal-project policy; required human approvals and GitHub protections still apply.
+
+The first independent review covers the full PR diff, approved requirements and directly affected context. Later rounds cover earlier findings, subsequent changes and their direct effects, including same-head Lead replies that change a finding's disposition. Unchanged issues missed in the first round do not become new blockers in later rounds. Review findings, Lead's fixes or reasoned rejections, and the review conclusion live on the GitHub PR. A rejection needs a concrete reason and evidence, and cannot waive approved requirements, required human approval or GitHub protections. Linear links to this discussion instead of copying a second detailed review.
+
 Review produces one of:
 
-- Ready to merge, with evidence tied to the PR head and review snapshots.
-- Needs changes: return Todo and continue the existing branch/PR.
-- Needs human: remain In review, add `needs-human`, and write the concrete question.
-- Blocked: record missing external prerequisites or authority.
+- Ready to merge: current-head verification and review are complete, blocking findings have an evidenced disposition, and required human gates are satisfied.
+- Needs changes: return Todo to the original Lead and continue the existing branch/PR, including fixable code, tests, CI/CD, smoke-test or evidence gaps.
+- Needs human review or acceptance: completed work remains In Review with `needs-human` and a concrete request.
+- Blocked: record an external prerequisite or a mid-execution decision; add `needs-human` when the owner must decide.
 
-A separate merge-planning turn selects candidates and order. New commits or changed review metadata invalidate approval. The controller then serially updates a PR against the latest target, waits for CI and renewed review if the head changed, rechecks target health, and merges with an expected-head check. A conflict or failed PR CI returns the issue to Todo with the reason. Missing/pending CI never counts as success. The current implementation conservatively requires all reported PR checks to pass, as well as branch-required checks.
+Normal pending CI stays in progress while Lead waits, polling with code every five minutes for up to 120 minutes per round. Pending alone is not a blocker or completed verification. The coordinator's polling schedule above is unchanged.
+
+The Merge planning agent evaluates order, dependencies, overlapping changes and integration risk using the completed reviews. It does not repeat full code review, edit code or merge. SQLite retains a candidate signature and order for recovery; candidates are not a frozen batch. The pure TypeScript coordinator rechecks live facts and serially updates/merges an eligible PR with an expected-head check. It merges one PR, then waits for healthy target CI before the next merge.
+
+Any head update invalidates the previous merge permission, including the coordinator's update against the latest target. Required new-head verification returns to the original Lead in Todo; pending CI does not trigger an immediate full review. Once evidence is complete, the PR returns to In Review for incremental review and fresh merge permission. A conflict or failed PR CI also returns Todo with the reason. Missing/pending CI never counts as success. The current implementation conservatively requires all reported PR checks to pass, as well as branch-required checks.
 
 ## Target CI failure and cleanup
 

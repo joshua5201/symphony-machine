@@ -59,6 +59,7 @@ repositories:
       todo: Todo
       in_progress: In Progress
       review: In Review
+      ready_to_merge: Ready to merge
       blocked: Blocked
       done: Done
       backlog: Backlog

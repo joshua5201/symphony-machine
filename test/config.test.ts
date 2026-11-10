@@ -29,6 +29,7 @@ test("worktrees default inside each repository while explicit roots retain confi
           team: "Demo",
           project: "Relative",
           worktree_root: "custom-worktrees",
+          states: { ready_to_merge: "Merge queue" },
           concurrency: { execution_tickets: 1, reviews: 2 },
         },
         {
@@ -54,6 +55,9 @@ test("worktrees default inside each repository while explicit roots retain confi
   assert.equal(relativeRepo.worktree_root, join(directory, "custom-worktrees"));
   assert.equal(absoluteRepo.worktree_root, explicitRoot);
   assert.equal(config.data_dir, join(directory, "runtime-data"));
+  assert.equal(defaultRepo.states.ready_to_merge, "Ready to merge");
+  assert.equal(relativeRepo.states.ready_to_merge, "Merge queue");
+  assert.equal(relativeRepo.states.review, "In Review");
   assert.deepEqual(defaultRepo.concurrency, {
     execution_tickets: 3,
     reviews: 1,

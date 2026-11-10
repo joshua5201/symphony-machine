@@ -19,6 +19,8 @@ export type Job = {
   workspace?: { path: string; branch: string; baseline: string };
   prNumber?: number;
   head?: string;
+  // Last completed independent PR review; discussion remains on GitHub.
+  reviewedHead?: string;
   fingerprint?: string;
   summary?: string;
   maintenance?: MaintenanceScan;

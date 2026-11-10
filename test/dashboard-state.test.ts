@@ -157,6 +157,9 @@ class FakeGitHub {
     assert.ok(value, `Unknown PR ${number}`);
     return structuredClone(value);
   }
+  async reviewContext(number: number) {
+    return { fingerprint: `context-${number}`, reviews: [], comments: [], inlineComments: [] };
+  }
   async findPr(branch: string) {
     return (
       [...this.prs.values()].find((value) => value.branch === branch) ?? null
@@ -405,11 +408,13 @@ test("kanban shows all Todo and handled tickets with independent Linear and agen
     issue(7, { state: "Canceled" }),
     issue(8, { state: "Blocked" }),
     issue(9, { state: "Backlog" }),
+    issue(10, { state: "Merge queue" }),
   ];
   const f = await fixture(t, tasks);
   f.store.set("pause:all", true);
   f.config.linear.needs_human_label = "human-review";
   f.config.repositories[0].states.done = "Delivered";
+  f.config.repositories[0].states.ready_to_merge = "Merge queue";
   f.config.repositories[0].path += "/owner's repo";
   for (const index of [2, 3, 4, 6, 7])
     f.store.save(
@@ -419,6 +424,7 @@ test("kanban shows all Todo and handled tickets with independent Linear and agen
       }),
     );
   f.store.save(savedJob(tasks[4], "review", { status: "done" }));
+  f.store.save(savedJob(tasks[9], "review", { status: "done" }));
   f.store.save(
     savedJob(issue(90), "maintenance", {
       createdIssueIds: [tasks[8].identifier, tasks[0].identifier],
@@ -429,6 +435,7 @@ test("kanban shows all Todo and handled tickets with independent Linear and agen
   const project = f.machine.dashboard().projects[0];
   assert.deepEqual(project.tickets.map((ticket) => ticket.identifier).sort(), [
     "ENG-1",
+    "ENG-10",
     "ENG-2",
     "ENG-3",
     "ENG-4",
@@ -458,6 +465,10 @@ test("kanban shows all Todo and handled tickets with independent Linear and agen
   assert.equal(byId("ENG-7").column, "other");
   assert.equal(byId("ENG-8").blockedAt, null);
   assert.equal(byId("ENG-9").column, "other");
+  assert.equal(byId("ENG-10").column, "ready_to_merge");
+  assert.equal(byId("ENG-10").state, "Merge queue");
+  assert.equal(byId("ENG-10").agentStatus, "done");
+  assert.equal(byId("ENG-10").completedAt, null);
   assert.equal(project.ticketsStale, false);
   assert.ok(project.ticketsUpdatedAt);
   assert.deepEqual(f.store.jobs(), jobsBefore);

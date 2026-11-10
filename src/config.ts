@@ -84,6 +84,7 @@ const schema = z.object({
             todo: z.string().default("Todo"),
             in_progress: z.string().default("In Progress"),
             review: z.string().default("In Review"),
+            ready_to_merge: z.string().default("Ready to merge"),
             blocked: z.string().default("Blocked"),
             done: z.string().default("Done"),
             backlog: z.string().default("Backlog"),

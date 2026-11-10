@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { appendFile, lstat, mkdir, readFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
@@ -28,6 +29,48 @@ export interface PrInfo {
   checks: CheckStatus;
   reviewDecision: string;
   updatedAt: string;
+}
+
+export interface PrComment {
+  id: number;
+  author: string | null;
+  body: string;
+  url: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PrReview {
+  id: number;
+  author: string | null;
+  body: string;
+  url: string;
+  state: string;
+  commitId: string | null;
+  // GitHub's reviews REST endpoint has no updated_at field.
+  submittedAt: string | null;
+}
+
+export interface PrInlineComment extends PrComment {
+  reviewId: number | null;
+  inReplyToId: number | null;
+  commitId: string | null;
+  originalCommitId: string | null;
+  path: string;
+  line: number | null;
+  originalLine: number | null;
+  side: string | null;
+  startLine: number | null;
+  originalStartLine: number | null;
+  startSide: string | null;
+}
+
+export interface PrReviewContext {
+  /** Discussion only; the PR head is tracked separately through PrInfo. */
+  fingerprint: string;
+  reviews: PrReview[];
+  comments: PrComment[];
+  inlineComments: PrInlineComment[];
 }
 
 export interface Workspace {
@@ -78,6 +121,39 @@ interface RawPr {
   updatedAt: string;
   statusCheckRollup:
     { status?: string; conclusion?: string; state?: string }[] | null;
+}
+
+interface RawComment {
+  id: number;
+  user: { login: string } | null;
+  body: string | null;
+  html_url: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface RawReview {
+  id: number;
+  user: { login: string } | null;
+  body: string | null;
+  html_url: string;
+  state: string;
+  commit_id: string | null;
+  submitted_at: string | null;
+}
+
+interface RawInlineComment extends RawComment {
+  pull_request_review_id: number | null;
+  in_reply_to_id?: number;
+  commit_id: string | null;
+  original_commit_id: string | null;
+  path: string;
+  line?: number | null;
+  original_line?: number | null;
+  side?: string;
+  start_line?: number | null;
+  original_start_line?: number | null;
+  start_side?: string | null;
 }
 
 interface WorkflowRun {
@@ -176,6 +252,17 @@ function toPr(raw: RawPr): PrInfo {
     checks: aggregate((raw.statusCheckRollup ?? []).map(checkStatus)),
     reviewDecision: raw.reviewDecision ?? "",
     updatedAt: raw.updatedAt,
+  };
+}
+
+function toComment(raw: RawComment): PrComment {
+  return {
+    id: raw.id,
+    author: raw.user?.login ?? null,
+    body: raw.body ?? "",
+    url: raw.html_url,
+    createdAt: raw.created_at,
+    updatedAt: raw.updated_at,
   };
 }
 
@@ -369,6 +456,64 @@ export class GitHub {
         await this.gh(["pr", "view", String(number), "--json", prFields]),
       ) as RawPr,
     );
+  }
+
+  /** Read the GitHub-owned discussion without persisting review content. */
+  async reviewContext(number: number): Promise<PrReviewContext> {
+    if (!Number.isSafeInteger(number) || number < 1)
+      throw new Error("Invalid pull request number");
+    const repository = this.repo.github
+      .split("/")
+      .map(encodeURIComponent)
+      .join("/");
+    const list = async <T extends { id: number }>(
+      endpoint: string,
+    ): Promise<T[]> => {
+      // gh api does not accept --repo. --slurp preserves all paginated arrays.
+      const pages = JSON.parse(
+        await this.command("gh", [
+          "api",
+          `repos/${repository}/${endpoint}?per_page=100`,
+          "--paginate",
+          "--slurp",
+        ]),
+      ) as T[][];
+      return pages.flat().sort((a, b) => a.id - b.id);
+    };
+    const [rawReviews, rawComments, rawInlineComments] = await Promise.all([
+      list<RawReview>(`pulls/${number}/reviews`),
+      list<RawComment>(`issues/${number}/comments`),
+      list<RawInlineComment>(`pulls/${number}/comments`),
+    ]);
+    const reviews = rawReviews.map((raw): PrReview => ({
+      id: raw.id,
+      author: raw.user?.login ?? null,
+      body: raw.body ?? "",
+      url: raw.html_url,
+      state: raw.state,
+      commitId: raw.commit_id ?? null,
+      submittedAt: raw.submitted_at ?? null,
+    }));
+    const comments = rawComments.map(toComment);
+    const inlineComments = rawInlineComments.map((raw): PrInlineComment => ({
+      ...toComment(raw),
+      reviewId: raw.pull_request_review_id ?? null,
+      inReplyToId: raw.in_reply_to_id ?? null,
+      commitId: raw.commit_id ?? null,
+      originalCommitId: raw.original_commit_id ?? null,
+      path: raw.path,
+      line: raw.line ?? null,
+      originalLine: raw.original_line ?? null,
+      side: raw.side ?? null,
+      startLine: raw.start_line ?? null,
+      originalStartLine: raw.original_start_line ?? null,
+      startSide: raw.start_side ?? null,
+    }));
+    const discussion = { reviews, comments, inlineComments };
+    const fingerprint = createHash("sha256")
+      .update(JSON.stringify(discussion))
+      .digest("hex");
+    return { fingerprint, ...discussion };
   }
 
   async findPr(branch: string): Promise<PrInfo | null> {

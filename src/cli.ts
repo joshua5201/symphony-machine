@@ -211,8 +211,12 @@ async function main() {
     await linear.connect();
     // Validate real issue shapes before any background agent can be dispatched.
     for (const r of config.repositories) {
-      for (const state of [r.states.todo, r.states.review]) {
-        await linear.listIssues({team:r.team,project:r.project,state});
+      for (const state of [
+        r.states.todo,
+        r.states.review,
+        r.states.ready_to_merge,
+      ]) {
+        await linear.listIssues({ team: r.team, project: r.project, state });
       }
     }
     await runner.start();
@@ -228,7 +232,7 @@ async function main() {
       );
     if (command === "doctor") {
       console.log(
-        "Ready: configured GitHub workflows verified, Todo/review issues parsed, Codex ChatGPT OAuth active, controller Linear MCP and Codex Linear MCP connected. No agent turn or repository mutation was started.",
+        "Ready: configured GitHub workflows verified, Todo/review/ready-to-merge issues parsed, Codex ChatGPT OAuth active, controller Linear MCP and Codex Linear MCP connected. No agent turn or repository mutation was started.",
       );
       return;
     }

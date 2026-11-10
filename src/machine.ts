@@ -28,6 +28,7 @@ type Decision = {
   summary: string;
   updatedAt: string;
   prUpdatedAt: string;
+  reviewFingerprint?: string;
 };
 type Sync = {
   id: string;
@@ -178,13 +179,15 @@ export class Machine {
           ? "todo"
           : state === r.states.in_progress
             ? "in_progress"
-            : state === r.states.review
-              ? "review"
-              : state === r.states.blocked
-                ? "blocked"
-                : state === r.states.done
-                  ? "done"
-                  : "other";
+            : state === r.states.ready_to_merge
+              ? "ready_to_merge"
+              : state === r.states.review
+                ? "review"
+                : state === r.states.blocked
+                  ? "blocked"
+                  : state === r.states.done
+                    ? "done"
+                    : "other";
       const blockedAt =
         issue?.stateHistory
           ?.filter((entry) => entry.state === r.states.blocked)
@@ -446,18 +449,6 @@ export class Machine {
           issue: j.identifier,
           error: String(error),
         });
-        if (
-          !abort.signal.aborted &&
-          !this.runner.failure &&
-          j.role === "review"
-        ) {
-          const r = this.config.repositories.find((r) => r.id === j.repo)!;
-          this.sync({
-            issueId: j.issueId,
-            state: r.states.blocked,
-            comment: `Symphony could not continue: ${String(error)}\nResolve the cause, then move this issue to ${r.states.todo} or use the retry command.`,
-          });
-        }
       })
       .finally(() => {
         this.active.delete(j.id);
@@ -602,7 +593,9 @@ export class Machine {
           j.summary = response.text;
           j.fingerprint = latest.updatedAt;
           j.status =
-            latest.state === r.states.review || latest.state === r.states.done
+            latest.state === r.states.review ||
+            latest.state === r.states.ready_to_merge ||
+            latest.state === r.states.done
               ? "done"
               : latest.state === r.states.blocked ||
                   latest.labels.includes(c.linear.needs_human_label)
@@ -617,12 +610,13 @@ export class Machine {
     }
   }
   private async reviews(r: Repo) {
-    const issues = await this.linear.listIssues({
-      team: r.team,
-      project: r.project,
-      state: r.states.review,
-    });
-    for (const issue of issues) {
+    const pages = await Promise.all(
+      [r.states.review, r.states.ready_to_merge].map((state) =>
+        this.linear.listIssues({ team: r.team, project: r.project, state }),
+      ),
+    );
+    const issues = new Map(pages.flat().map((issue) => [issue.id, issue]));
+    for (let issue of issues.values()) {
       if (
         this.count("review", r.id) + this.count("merge", r.id) >=
         r.concurrency.reviews
@@ -641,13 +635,41 @@ export class Machine {
         .find(Boolean);
       const number = execution?.prNumber ?? (own ? Number(own[1]) : undefined);
       if (!number) continue;
-      const pr = await this.githubFactory(r).pr(number);
+      const git = this.githubFactory(r);
+      const pr = await git.pr(number);
       if (pr.state !== "OPEN" || pr.base !== r.branch || pr.draft) continue;
       const old = this.job(r.id, issue.id, "review");
-      const fingerprint = `${pr.head}:${pr.updatedAt}:${issue.updatedAt}`;
-      if (old && (this.active.has(old.id) || old.fingerprint === fingerprint))
-        continue;
+      if (old && this.active.has(old.id)) continue;
+      const context = await git.reviewContext(number);
+      let fingerprint = `${pr.head}:${pr.updatedAt}:${issue.updatedAt}:${context.fingerprint}`;
+      if (old?.fingerprint === fingerprint) continue;
+      if (issue.state === r.states.ready_to_merge) {
+        this.store.set(`merge:${r.id}:${issue.id}`, null);
+        const changedHead = old?.reviewedHead && old.reviewedHead !== pr.head;
+        this.sync({
+          issueId: issue.id,
+          state: changedHead ? r.states.todo : r.states.review,
+          comment: changedHead
+            ? `PR #${number} head changed to ${pr.head}. Lead must verify the current-head delivery evidence and re-handoff to ${r.states.review}; subsequent code review remains incremental.`
+            : `PR #${number} review or ticket context changed. Recheck the PR discussion and required approvals before returning to ${r.states.ready_to_merge}.`,
+        });
+        if (changedHead) continue;
+        await this.flush();
+        issue = await this.linear.getIssue(issue.id);
+        if (issue.state !== r.states.review || this.skipIssue(issue)) continue;
+        fingerprint = `${pr.head}:${pr.updatedAt}:${issue.updatedAt}:${context.fingerprint}`;
+      }
       this.store.set(`merge:${r.id}:${issue.id}`, null);
+      if (pr.checks !== "success") {
+        if (pr.checks === "failure")
+          this.sync({
+            issueId: issue.id,
+            state: r.states.todo,
+            comment: `PR #${number} CI failed on ${pr.head}; Lead must repair the failure within the existing contract before independent review.`,
+          });
+        // Pending/missing CI is polled by code, not an agent-level blocker.
+        continue;
+      }
       const j = old ?? this.create(r, issue, "review");
       j.fingerprint = fingerprint;
       j.prNumber = number;
@@ -660,7 +682,14 @@ export class Machine {
             title: `${issue.identifier} · Review`,
             cwd: r.path,
             developerInstructions: contract(this.config, r),
-            prompt: reviewPrompt(this.config, r, issue, number, pr.head),
+            prompt: reviewPrompt(
+              this.config,
+              r,
+              issue,
+              number,
+              pr.head,
+              j.reviewedHead,
+            ),
             ...this.config.codex.review,
             signal,
             onThread: (id) => {
@@ -679,29 +708,51 @@ export class Machine {
           const result = response.result;
           j.summary = result.summary;
           j.status = "done";
-          const current = await this.githubFactory(r).pr(number);
+          const current = await git.pr(number);
+          const reviewedContext = await git.reviewContext(number);
           const latestIssue = await this.linear.getIssue(issue.id);
           if (
+            current.state !== "OPEN" ||
+            current.base !== r.branch ||
+            current.draft ||
+            current.checks !== "success" ||
             current.head !== pr.head ||
             latestIssue.description !== issue.description ||
             latestIssue.title !== issue.title ||
-            latestIssue.state !== r.states.review
+            latestIssue.state !== r.states.review ||
+            this.skipIssue(latestIssue)
           ) {
             j.fingerprint = undefined;
             this.store.save(j);
             return;
           }
-          j.fingerprint = `${current.head}:${current.updatedAt}:${latestIssue.updatedAt}`;
-          if (result.decision === "ready_to_merge")
+          j.reviewedHead = pr.head;
+          j.fingerprint = `${current.head}:${current.updatedAt}:${latestIssue.updatedAt}:${reviewedContext.fingerprint}`;
+          if (result.decision === "ready_to_merge") {
+            this.sync({ issueId: issue.id, state: r.states.ready_to_merge });
+            await this.flush();
+            const readyIssue = await this.linear.getIssue(issue.id);
+            if (
+              readyIssue.state !== r.states.ready_to_merge ||
+              readyIssue.description !== issue.description ||
+              readyIssue.title !== issue.title ||
+              this.skipIssue(readyIssue)
+            ) {
+              j.fingerprint = undefined;
+              this.store.save(j);
+              return;
+            }
+            j.fingerprint = `${current.head}:${current.updatedAt}:${readyIssue.updatedAt}:${reviewedContext.fingerprint}`;
             this.store.set(`merge:${r.id}:${issue.id}`, {
               issueId: issue.id,
               pr: number,
               head: pr.head,
               summary: result.summary,
-              updatedAt: latestIssue.updatedAt,
+              updatedAt: readyIssue.updatedAt,
               prUpdatedAt: current.updatedAt,
+              reviewFingerprint: reviewedContext.fingerprint,
             } satisfies Decision);
-          else if (result.decision === "needs_human")
+          } else if (result.decision === "needs_human")
             this.sync({
               issueId: issue.id,
               labels: [
@@ -776,7 +827,8 @@ export class Machine {
     const candidates: typeof approved = [];
     for (const candidate of approved) {
       const issue = await this.linear.getIssue(candidate.decision!.issueId);
-      if (!this.skipIssue(issue)) candidates.push(candidate);
+      if (issue.state === r.states.ready_to_merge && !this.skipIssue(issue))
+        candidates.push(candidate);
     }
     candidates.sort(
       (a, b) =>
@@ -817,7 +869,7 @@ export class Machine {
           cwd: r.path,
           title: `${r.id} · Merge planning`,
           developerInstructions: contract(this.config, r),
-          prompt: `${contract(this.config, r)}\nYou are the merge coordinator. Decide which approved candidates should merge this round and in which order. Read related Linear issues as needed. Prioritize CI repair, dependencies and product priorities; avoid arbitrary style work. Do not merge or edit code. Return decision done and issueIds in merge order (a subset is permitted), with rationale in summary. Candidates: ${JSON.stringify(candidates.map((x) => x.decision))}`,
+          prompt: `${contract(this.config, r)}\nYou are the Merge planning agent, separate from the programmatic coordinator that executes merges. Decide which independently reviewed ${r.states.ready_to_merge} candidates should merge this round and in which order. Read related Linear issues and relevant PR changes as needed. Prioritize CI repair, dependencies and product priorities. Assess overlap and concrete integration risks between these changes (interfaces, data/migrations, shared behavior and delivery order as applicable); do not repeat the independent code review or introduce style/extra-scope requirements. If a candidate needs actionable work or has an identified unavailable prerequisite, record a concise finding and PR evidence link on its Linear ticket and return it to ${r.states.todo} or ${r.states.blocked} respectively; human decision blockers also need an explicit escalation and ${this.config.linear.needs_human_label}. Normal pending CI is polled by the coordinator, not a reason to mark Blocked. Do not merge or edit code. Return decision done and issueIds in merge order (a subset is permitted), with rationale in summary. Candidates: ${JSON.stringify(candidates.map((x) => x.decision))}`,
           ...this.config.codex.review,
           signal,
           onThread: (id) => {
@@ -871,7 +923,7 @@ export class Machine {
         continue;
       const issue = await this.linear.getIssue(d.issueId);
       if (
-        issue.state !== r.states.review ||
+        issue.state !== r.states.ready_to_merge ||
         this.skipIssue(issue) ||
         !(await this.dependenciesReady(issue, r))
       )
@@ -882,15 +934,25 @@ export class Machine {
         await this.merged(r, issue, pr);
         continue;
       }
+      const context = await git.reviewContext(d.pr);
       if (
         pr.state !== "OPEN" ||
         pr.head !== d.head ||
         pr.updatedAt !== d.prUpdatedAt ||
-        issue.updatedAt !== d.updatedAt
+        issue.updatedAt !== d.updatedAt ||
+        context.fingerprint !== d.reviewFingerprint
       ) {
         this.store.set(`merge:${r.id}:${issue.id}`, null);
         job.fingerprint = undefined;
         this.store.save(job);
+        this.sync({
+          issueId: issue.id,
+          state: pr.head !== d.head ? r.states.todo : r.states.review,
+          comment:
+            pr.head !== d.head
+              ? `PR #${d.pr} head changed to ${pr.head}. Lead must refresh required delivery evidence, then request incremental review on the existing PR.`
+              : `PR #${d.pr} review or ticket context changed; the previous merge permission is invalid. Recheck the PR discussion before ${r.states.ready_to_merge}.`,
+        });
         continue;
       }
       const updated = await git.updateBranch(d.pr);
@@ -908,6 +970,11 @@ export class Machine {
         job.fingerprint = undefined;
         this.store.save(job);
         this.store.set(`merge:${r.id}:${issue.id}`, null);
+        this.sync({
+          issueId: issue.id,
+          state: r.states.todo,
+          comment: `Coordinator updated PR #${d.pr} from ${d.head} to ${fresh.head}. Lead must verify required current-head CI, deployment and affected smoke evidence in the existing branch/PR, then re-handoff to ${r.states.review}. Code review remains incremental from the last reviewed head.`,
+        });
         return;
       }
       if (fresh.checks === "failure") {
