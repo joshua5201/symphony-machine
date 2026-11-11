@@ -46,10 +46,11 @@ const schema = z.object({
     .prefault({}),
   polling: z
     .object({
-      linear_seconds: positive.default(30),
-      review_seconds: positive.default(60),
-      github_seconds: positive.default(30),
-      master_ci_seconds: positive.default(60),
+      linear_seconds: positive.default(120),
+      review_seconds: positive.default(180),
+      github_seconds: positive.default(120),
+      master_ci_seconds: positive.default(300),
+      dashboard_seconds: positive.default(300),
     })
     .prefault({}),
   maintenance: z

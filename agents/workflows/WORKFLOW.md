@@ -219,7 +219,7 @@ Lead 必須在 PR 記錄需要／不需要人類 code review 的理由，並在 
 - 改變 CI/CD、approval gate、merge 或 branch protection。
 - 需要 agent 無法提供的人類專業判斷或實際驗收。
 
-完成的成果只等這類人類審查／驗收時，保持 In Review 並加 `needs-human`，連到 PR 與具體待看項目。執行中需要人類決策才能繼續則為 Blocked＋`needs-human`；不能把未完成實作包裝成待人類 review。
+完成的成果只等這類人類審查／驗收時，保持 In Review 並加 `needs-human`，連到 PR 與具體待看項目。人類完成審查／驗收後，將 issue 移到 Ready to merge 即完成交接，不需另外建立 SQLite permission；此時殘留的 `needs-human` 不阻擋 merge 流程，`no-auto-pickup` 仍優先禁止自動接手。其他狀態的 `needs-human` 仍須等待人類處理。執行中需要人類決策才能繼續則為 Blocked＋`needs-human`；不能把未完成實作包裝成待人類 review。
 
 ### 獨立 Code Reviewer
 
@@ -234,7 +234,7 @@ Lead 必須在 PR 記錄需要／不需要人類 code review 的理由，並在 
 
 可閱讀 callers／callees 等既有 code 理解行為與 regression；這是 context，不是擴張 ticket 或全面審查 repo 的授權。阻擋 finding 必須有具體位置、觸發條件、影響及證據，並指出違反的要件、既有契約或本次引入／加劇的缺陷。個人偏好、nit、想像中的未來案例及無需求依據的測試矩陣不得阻擋交付。既有且非本次造成的問題，自主建立對應 project 的 Backlog ticket 給人類 triage；已有相同 ticket 可沿用。簡述問題、影響、證據與來源 issue／PR，不順手擴大本次修正。若確實阻擋本次 contract／必要驗證，說明依賴，需人類決定時進 Blocked。
 
-後續 review 只檢查前輪 findings 的處置、前輪後的新修改與其直接影響。同一 head 上新增的 Lead 回覆也可能需要確認處置，不要求為了回應 finding 製造 code commit。不得把首輪漏看、且後來沒有改動或因新修改而受影響的既有問題，追加成本輪新 blocker。Reviewer 在 PR 留下已審 head、範圍與結論，讓下一輪沿用已完成的審查，不每次重新全面 review。
+後續 review 只檢查前輪 findings 的處置、前輪後的新修改與其直接影響。同一 head 上新增的 Lead 回覆也可能需要確認處置，不要求為了回應 finding 製造 code commit。只有 timestamp 改變不構成再審理由。不得把首輪漏看、且後來沒有改動或因新修改而受影響的既有問題，追加成本輪新 blocker。Reviewer 在 PR 留下已審 head、範圍與結論，讓下一輪沿用已完成的審查，不每次重新全面 review。
 
 ### Finding 處置與交接
 
@@ -254,11 +254,11 @@ Lead 準備 open、non-draft 且以 configured branch 為 target 的 PR，提供
 
 ### Merge 規劃與執行
 
-Ready to merge 是 Code Reviewer 到 merge 流程的交接。Merge agent 只評估候選順序、依賴、修改重疊與整合風險，引用既有 review 結論，不重做完整 code review、不寫程式、不 merge。純 TypeScript coordinator 依計畫重新讀取 GitHub／Linear facts，執行 checks、expected-head merge 與清理；agent 不取得這些執行責任。
+Linear 的 Ready to merge 是 review 完成到 merge 流程的權威交接，包含人類完成必要審查／驗收後直接移入的 issue；不要求另有 SQLite merge-permission 紀錄。Merge agent 只評估候選順序、依賴、修改重疊與整合風險，引用既有 review 結論，不重做完整 code review、不寫程式、不 update branch／rebase／解 conflict，也不 merge。純 TypeScript coordinator 依計畫重新讀取 GitHub／Linear facts，執行 checks、expected-head merge 與清理，不自動更新 PR branch；agent 不取得這些執行責任。Ready to merge 不豁免目前 head 的驗證、CI、依賴或 GitHub protections。
 
-SQLite 保存候選 signature 與順序作為執行／恢復計畫，不凍結一批候選。候選或相關 facts 改變時重新規劃；每次只 merge 一份，之後等待當前 target CI 成功，再選下一份。缺失或 pending CI 都不是通過；target CI 失敗依既有 CI repair 流程處理。
+SQLite 保存候選 signature 與順序作為執行／恢復計畫，不授予或取代 Linear 的 merge 交接，也不凍結一批候選。候選或相關 facts 改變時重新規劃；每次只 merge 一份，之後等待當前 target CI 成功，再選下一份。缺失或 pending CI 都不是通過；target CI 失敗依既有 CI repair 流程處理。
 
-任何 PR head 更新都使舊 merge permission 失效，包括 coordinator 為追上 target 所做的 update-branch。需要新 head 驗證時，回 Todo 交原 Lead 取得必要 CI/CD／smoke／其他受影響證據；CI pending 時不立即啟動完整 review。證據完成後回 In Review 增量再審；後續仍須取得當前 head 的 merge permission，不沿用舊 head 的批准。
+遇到 conflict 或必要的 branch update，回 Todo 交原 Lead，說明原因、PR 與受影響範圍，並移除 Ready to merge 已完成的人類交接所殘留的 `needs-human`，讓 Lead 可續做；若有新的待決人類問題，仍依升級流程加上該 label。由 Lead 在原 branch／PR 處理整合，完成受影響修改與必要 CI/CD／smoke 驗證，再回 In Review 增量審查。其他 PR head 更新也須確認受影響部分的新 head 證據，不能沿用不適用的舊證據；CI pending 時不立即啟動完整 review。審查完成後重新交接 Ready to merge；單純 timestamp 改變不使完成的 review 失效。
 
 退回與完成的狀態交接依 Linear interface contract，通常沿用 branch／PR／workpad，不固定全部重開。Runner 情境由 coordinator 負責 merge／清理，Done 由 Linear–GitHub integration 更新；Execute 不自行處理。手動情境也只能執行已有明確授權的 merge／deploy，不因 In Review、Ready to merge 或 Closed 自動取得外部操作權限。
 

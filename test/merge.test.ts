@@ -38,7 +38,6 @@ function setup(t: TestContext) {
   const issues = new Map<string, LinearIssue>();
   const prs = new Map<number, PrInfo>();
   const merges: Array<{ number: number; head: string }> = [];
-  const updates: number[] = [];
   const cleanups: Array<{ workspace: Job["workspace"]; number: number }> = [];
   const linearWrites: Array<{
     issueId: string;
@@ -48,7 +47,6 @@ function setup(t: TestContext) {
   const state = {
     targetHealth: "success" as HealthStatus,
     targetReads: 0,
-    branchUpdate: "current" as "current" | "updated" | "conflict",
     reviewFingerprint: "context-1",
     plannedOrder: [] as string[],
     runner: async (_input: unknown): Promise<any> => ({
@@ -65,8 +63,10 @@ function setup(t: TestContext) {
       assert(issues.has(id), `Unknown issue ${id}`);
       return structuredClone(issues.get(id)!);
     },
-    async listIssues() {
-      return [...issues.values()].map((value) => structuredClone(value));
+    async listIssues(filter: { state?: string }) {
+      return [...issues.values()]
+        .filter((value) => !filter.state || value.state === filter.state)
+        .map((value) => structuredClone(value));
     },
     async updateIssue(
       issueId: string,
@@ -87,13 +87,13 @@ function setup(t: TestContext) {
       return structuredClone(prs.get(number)!);
     },
     async reviewContext(number: number) {
-      return { fingerprint: number === 1 ? state.reviewFingerprint : `context-${number}`, reviews: [], comments: [], inlineComments: [] };
-    },
-    async updateBranch(number: number) {
-      updates.push(number);
-      if (state.branchUpdate === "updated")
-        prs.get(number)!.head = "head-after-base-update";
-      return state.branchUpdate;
+      return {
+        fingerprint:
+          number === 1 ? state.reviewFingerprint : `context-${number}`,
+        reviews: [],
+        comments: [],
+        inlineComments: [],
+      };
     },
     async masterHealth() {
       state.targetReads++;
@@ -180,15 +180,6 @@ function setup(t: TestContext) {
     prs.set(number, pr);
     store.save(execution);
     store.save(review);
-    store.set(`merge:${repo.id}:${id}`, {
-      issueId: id,
-      pr: number,
-      head: pr.head,
-      summary: "Requirements verified",
-      updatedAt: issue.updatedAt,
-      prUpdatedAt: pr.updatedAt,
-      reviewFingerprint: `context-${number}`,
-    });
     state.plannedOrder.push(id);
     store.set(`health:${repo.id}`, {
       sha: "target-head",
@@ -209,7 +200,6 @@ function setup(t: TestContext) {
     issues,
     prs,
     merges,
-    updates,
     cleanups,
     linearWrites,
     candidate,
@@ -217,31 +207,6 @@ function setup(t: TestContext) {
     plan,
   };
 }
-
-test("stale head, PR review metadata, or Linear review snapshot cannot authorize merging", async (t) => {
-  for (const change of ["head", "pr-metadata", "issue-metadata"] as const)
-    await t.test(change, async (t) => {
-      const f = setup(t);
-      const { issue, pr, review } = f.candidate();
-      await f.plan();
-      if (change === "head") pr.head = "new-unreviewed-head";
-      else if (change === "pr-metadata")
-        pr.updatedAt = "2026-11-07T00:02:00.000Z";
-      else issue.updatedAt = "2026-11-07T00:02:00.000Z";
-      await f.merge();
-      assert.deepEqual(f.merges, []);
-      assert.deepEqual(
-        f.updates,
-        [],
-        "stale approvals must be rejected before branch mutation",
-      );
-      assert.equal(f.store.get(`merge:${f.repo.id}:${issue.id}`), null);
-      assert.equal(
-        f.store.jobs().find((job) => job.id === review.id)!.fingerprint,
-        undefined,
-      );
-    });
-});
 
 test("failed target CI pauses ordinary merges and permits a checked CI repair candidate", async (t) => {
   const f = setup(t);
@@ -253,17 +218,13 @@ test("failed target CI pauses ordinary merges and permits a checked CI repair ca
   await f.plan();
   await f.merge();
   assert.deepEqual(f.merges, []);
-  assert.deepEqual(
-    f.updates,
-    [repair.pr.number],
-    "ordinary work stays paused even when the planner puts it first",
-  );
   assert.equal(
     f.state.targetReads,
     0,
     "pending repair checks must gate the merge",
   );
   repair.pr.checks = "success";
+  await f.plan();
   await f.merge();
   assert.deepEqual(f.merges, [
     { number: repair.pr.number, head: repair.pr.head },
@@ -282,7 +243,6 @@ test("no-auto-pickup excludes approved work from merge planning and a cached mer
   issue.labels = ["no-auto-pickup"];
   await f.plan();
   assert.equal(f.store.jobs().filter((job) => job.role === "merge").length, 0);
-  assert.deepEqual(f.updates, []);
   assert.deepEqual(f.merges, []);
 
   issue.labels = [];
@@ -290,7 +250,6 @@ test("no-auto-pickup excludes approved work from merge planning and a cached mer
   assert.equal(f.store.jobs().filter((job) => job.role === "merge").length, 1);
   issue.labels = ["no-auto-pickup"];
   await f.merge();
-  assert.deepEqual(f.updates, []);
   assert.deepEqual(f.merges, []);
   assert.deepEqual(f.linearWrites, []);
 });
@@ -309,65 +268,12 @@ test("a newly failed target CI check prevents an ordinary merge", async (t) => {
   );
 });
 
-test("a branch conflict queues Todo with an explanation and invalidates its merge approval", async (t) => {
-  const f = setup(t);
-  const { issue } = f.candidate();
-  f.state.branchUpdate = "conflict";
-  await f.plan();
-  await f.merge();
-  assert.deepEqual(f.merges, []);
-  assert.equal(f.store.get(`merge:${f.repo.id}:${issue.id}`), null);
-  const outbox =
-    f.store.get<Array<{ issueId: string; state: string; comment: string }>>(
-      "outbox",
-    )!;
-  assert.equal(outbox[0].issueId, issue.id);
-  assert.equal(outbox[0].state, f.repo.states.todo);
-  assert.match(outbox[0].comment, /conflicts with master/);
-  await f.machine.flush();
-  assert.equal(issue.state, f.repo.states.todo);
-});
-
-test("updating a PR branch invalidates its review before any merge", async (t) => {
-  const f = setup(t);
-  const { issue, review } = f.candidate();
-  f.state.branchUpdate = "updated";
-  await f.plan();
-  await f.merge();
-  assert.deepEqual(f.merges, []);
-  assert.equal(f.store.get(`merge:${f.repo.id}:${issue.id}`), null);
-  assert.equal(
-    f.store.jobs().find((job) => job.id === review.id)!.fingerprint,
-    undefined,
-  );
-  assert.equal(f.state.targetReads, 0);
-  await f.machine.flush();
-  assert.equal(issue.state, f.repo.states.todo);
-  assert.match(f.linearWrites.at(-1)!.comment!, /current-head CI/);
-  assert.equal(f.store.jobs().find((job) => job.id === review.id)!.reviewedHead, "reviewed-head-1");
-});
-
-test("a new PR discussion invalidates merge permission even when GitHub head and PR timestamps are unchanged", async (t) => {
-  const f = setup(t);
-  const { issue, pr } = f.candidate();
-  await f.plan();
-  f.state.reviewFingerprint = "new-owner-or-lead-reply";
-  await f.merge();
-  assert.deepEqual(f.updates, []);
-  assert.deepEqual(f.merges, []);
-  assert.equal(pr.head, "reviewed-head-1");
-  await f.machine.flush();
-  assert.equal(issue.state, f.repo.states.review);
-  assert.equal(f.store.get(`merge:${f.repo.id}:${issue.id}`), null);
-});
-
 test("a verified merge preserves Linear state while managed cleanup proceeds", async (t) => {
   const f = setup(t);
   const { issue, pr, execution } = f.candidate();
   await f.plan();
   await f.merge();
   assert.deepEqual(f.merges, [{ number: pr.number, head: pr.head }]);
-  assert.equal(f.store.get(`merge:${f.repo.id}:${issue.id}`), null);
   assert.equal(f.store.get(`cleanup:${execution.id}`), true);
   assert.deepEqual(f.cleanups, [], "cleanup follows the confirmed merge");
   assert.equal(
@@ -399,15 +305,15 @@ test("a PR merged into a different target retains its workspace and Linear revie
   assert.equal(f.store.get(`cleanup:${execution.id}`), undefined);
 });
 
-test("an interrupted new review cannot leave a previous merge approval usable", async (t) => {
+test("an interrupted review remains In Review and is not a merge candidate", async (t) => {
   const f = setup(t);
   const { issue, review } = f.candidate();
+  issue.state = f.repo.states.review;
   review.fingerprint = "old-review";
   f.store.save(review);
   f.state.runner = async () => ({ outcome: "interrupted" });
   await (f.machine as any).reviews(f.repo);
   await f.machine.drain();
-  assert.equal(f.store.get(`merge:${f.repo.id}:${issue.id}`), null);
   await f.merge();
   assert.deepEqual(f.merges, []);
 });

@@ -197,6 +197,7 @@ async function fixture(
         review_seconds: 1,
         github_seconds: 1,
         master_ci_seconds: 1,
+        dashboard_seconds: 1,
       },
       repositories: [
         {
@@ -496,6 +497,51 @@ test("kanban retains its last Linear snapshot and marks it stale on a read failu
   assert.deepEqual(after.tickets, before.tickets);
   assert.equal(after.ticketsStale, true);
   assert.deepEqual(f.linear.updates, []);
+});
+
+test("dashboard uses its own slower Linear schedule and backs off the entire snapshot after one failed read", async (t) => {
+  const tasks = [issue(1, { state: "Blocked" }), issue(2, { state: "Done" })];
+  const f = await fixture(t, tasks);
+  f.store.set("pause:all", true);
+  f.config.polling.dashboard_seconds = 10;
+  for (const task of tasks) f.store.save(savedJob(task, "execution"));
+  let lists = 0;
+  let reads = 0;
+  let unavailable = false;
+  const list = f.linear.listIssues.bind(f.linear);
+  const get = f.linear.getIssue.bind(f.linear);
+  f.linear.listIssues = async (filter) => {
+    lists++;
+    return list(filter);
+  };
+  f.linear.getIssue = async (id) => {
+    reads++;
+    if (unavailable) throw new Error("Linear temporarily unavailable: 502");
+    return get(id);
+  };
+  await f.machine.tick(1_000);
+  const before = f.machine.dashboard().projects[0];
+  await f.machine.tick(3_000);
+  assert.equal(lists, 1, "dispatch interval does not control dashboard reads");
+  unavailable = true;
+  await f.machine.tick(11_000);
+  assert.equal(reads, 3, "stop after the first failed historical ticket read");
+  assert.deepEqual(f.machine.dashboard().projects[0].tickets, before.tickets);
+  assert.equal(f.machine.dashboard().projects[0].ticketsUpdatedAt, before.ticketsUpdatedAt);
+  assert.equal(f.machine.dashboard().projects[0].ticketsStale, true);
+  const backoff = f.logs.findLast((log) => log.event === "dashboard_poll_backoff")!.details as { retryAt: string; retryInMs: number };
+  assert.ok(backoff.retryInMs >= 20_000 && backoff.retryInMs <= 40_000);
+  const retryAt = Date.parse(backoff.retryAt);
+  await f.machine.tick(retryAt - 1);
+  assert.equal(lists, 2);
+  unavailable = false;
+  await f.machine.tick(retryAt);
+  assert.equal(lists, 3);
+  assert.equal(f.machine.dashboard().projects[0].ticketsStale, false);
+  unavailable = true;
+  await f.machine.tick(retryAt + 10_000);
+  const reset = f.logs.findLast((log) => log.event === "dashboard_poll_backoff")!.details as { failures: number };
+  assert.equal(reset.failures, 1, "successful snapshots reset the failure sequence");
 });
 
 test("dashboard listener configuration changes require restart", async (t) => {

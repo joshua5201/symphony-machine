@@ -1,3 +1,12 @@
+import retry from "retry";
+
+const retryDelays = retry.timeouts({
+  minTimeout: 60_000,
+  factor: 2,
+  maxTimeout: 900_000,
+  retries: 6,
+});
+
 export const dashboardPage: string = String.raw`<!doctype html>
 <html lang="zh-Hant">
 <head>
@@ -47,7 +56,14 @@ export const dashboardPage: string = String.raw`<!doctype html>
     .project-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
     .project-title { margin: 0; font-size: 18px; letter-spacing: -.025em; overflow-wrap: anywhere; }
     .repository { margin: 4px 0 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
-    .read-only { border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .runner-control { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+    #runner-control { margin-bottom: 18px; }
+    .control-state { color: var(--muted); font-size: 12px; line-height: 1.7; }
+    .control-state[data-state="paused"], .control-state[data-state="pausing"] { color: #94651f; }
+    .control-button { border: 1px solid #cbd6e8; border-radius: 7px; background: #fff; color: var(--accent); padding: 8px 12px; cursor: pointer; font-size: 12px; min-height: 36px; }
+    .control-button:hover:enabled { background: #edf2fc; }
+    .control-button:disabled { opacity: .55; cursor: default; }
+    .control-error { margin: 0 0 14px; color: #ad4f4b; font-size: 12px; line-height: 1.7; }
     .section { margin-top: 20px; }
     .section-heading { display: flex; align-items: center; gap: 9px; margin: 0 0 10px; }
     h3 { margin: 0; font-size: 13px; font-weight: 650; }
@@ -86,6 +102,7 @@ export const dashboardPage: string = String.raw`<!doctype html>
     .tag { display: inline-flex; align-items: center; border-radius: 4px; padding: 1px 5px; color: #5e6a7b; background: #f0f3f7; font-size: 10px; font-weight: 500; line-height: 1.6; }
     .tag.mode { color: #5269a0; background: #eef2fb; }
     .tag.human-review { color: #87540d; background: #fff0cd; border: 1px solid #f1d591; font-weight: 650; }
+    .tag.no-auto-pickup { color: #684b85; background: #f3eef8; border: 1px solid #dfd2eb; }
     .session { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 7px; }
     .session > summary { color: var(--muted); font-size: 10px; cursor: pointer; }
     .resume-command { display: block; width: 100%; resize: vertical; margin-top: 7px; border: 1px solid #dbe2ec; border-radius: 4px; background: #f7f9fc; color: #435168; padding: 7px; font: 10px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
@@ -152,10 +169,12 @@ export const dashboardPage: string = String.raw`<!doctype html>
         <div id="connection-detail" class="connection-detail">等待第一筆狀態</div>
       </div>
     </header>
+    <div id="runner-control"></div>
+    <p id="control-error" class="control-error" role="alert" hidden></p>
     <nav id="project-tabs" class="tabs" role="tablist" aria-label="專案" hidden></nav>
     <div id="projects"></div>
     <p id="page-empty" class="page-empty">正在讀取工作狀態…</p>
-    <p class="footer">每 5 秒自動更新 · 此頁面僅供查看</p>
+    <p class="footer">每 30 秒自動更新 · 可暫停或繼續 Symphony 工作</p>
     <noscript><p class="page-empty">請啟用 JavaScript 以讀取工作狀態。</p></noscript>
   </main>
   <script>
@@ -167,6 +186,7 @@ export const dashboardPage: string = String.raw`<!doctype html>
     const connection = document.getElementById('connection');
     const connectionLabel = document.getElementById('connection-label');
     const connectionDetail = document.getElementById('connection-detail');
+    const controlError = document.getElementById('control-error');
     const projectViews = new Map();
     const statusLabels = { running: '執行中', waiting: '等待中', blocked: '受阻', done: '已完成', failed: '失敗' };
     const ticketColumns = [
@@ -182,6 +202,14 @@ export const dashboardPage: string = String.raw`<!doctype html>
     let nextViewId = 0;
     let lastUpdatedAt = null;
     let refreshing = false;
+    let refreshTimer = null;
+    let failedRefreshes = 0;
+    let lastSnapshot = null;
+    let pendingControl = null;
+    let controlVersion = 0;
+    const retryDelays = ${JSON.stringify(retryDelays)};
+    const globalControl = createControl('all');
+    document.getElementById('runner-control').append(globalControl.root);
 
     function element(tag, className, text) {
       const node = document.createElement(tag);
@@ -193,6 +221,76 @@ export const dashboardPage: string = String.raw`<!doctype html>
     function setText(node, value) {
       const text = value == null ? '' : String(value);
       if (node.textContent !== text) node.textContent = text;
+    }
+
+    function createControl(repo) {
+      const root = element('div', 'runner-control');
+      const state = element('span', 'control-state', '正在讀取執行狀態…');
+      state.setAttribute('role', 'status');
+      state.setAttribute('aria-live', 'polite');
+      const button = element('button', 'control-button', repo === 'all' ? '暫停全部' : '暫停專案');
+      button.type = 'button';
+      button.disabled = true;
+      button.addEventListener('click', () => {
+        if (!lastSnapshot || pendingControl !== null || button.disabled) return;
+        const scope = repo === 'all' ? lastSnapshot : lastSnapshot.projects.find((p) => p.id === repo);
+        if (scope) changePause(repo, !scope.paused);
+      });
+      root.append(state, button);
+      return { root, state, button };
+    }
+
+    function updateControl(view, scope, global) {
+      const paused = global ? scope.paused : scope.effectivePaused;
+      const inherited = !global && lastSnapshot.paused;
+      const state = lastSnapshot.stopping ? 'stopping' : paused ? (scope.activeAgents > 0 ? 'pausing' : 'paused') : 'running';
+      view.state.dataset.state = state;
+      const labels = { running: '執行中', pausing: '暫停中', paused: '已暫停', stopping: '正在關閉' };
+      setText(view.state, (global ? '全域：' : inherited ? '全域控制：' : '專案：') + labels[state] + ' · ' + scope.activeAgents + ' 個工作執行中');
+      setText(view.button, pendingControl === (global ? 'all' : scope.id)
+        ? '處理中…'
+        : inherited ? '全域已暫停' : scope.paused ? (global ? '解除全域暫停' : '繼續專案') : (global ? '暫停全部' : '暫停專案'));
+      view.button.disabled = pendingControl !== null || inherited || lastSnapshot.stopping;
+    }
+
+    function updateControls() {
+      if (!lastSnapshot) return;
+      updateControl(globalControl, lastSnapshot, true);
+      for (const project of lastSnapshot.projects) {
+        const view = projectViews.get(project.id);
+        if (view) updateControl(view.control, project, false);
+      }
+    }
+
+    async function changePause(repo, paused) {
+      pendingControl = repo;
+      controlVersion++;
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
+      controlError.hidden = true;
+      updateControls();
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      try {
+        const response = await fetch('/api/control', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Symphony-Control': '1' },
+          body: JSON.stringify({ repo, paused }),
+          signal: controller.signal,
+        });
+        if (!response.ok) throw new Error('Control request failed');
+        const data = await response.json();
+        if (!data || !Array.isArray(data.projects)) throw new Error('Invalid control response');
+        render(data);
+      } catch {
+        setText(controlError, '操作結果尚未確認，請等待狀態更新後再試。');
+        controlError.hidden = false;
+      } finally {
+        clearTimeout(timeout);
+        pendingControl = null;
+        updateControls();
+        if (!document.hidden) refresh();
+      }
     }
 
     function formattedDate(value, formatter) {
@@ -282,6 +380,8 @@ export const dashboardPage: string = String.raw`<!doctype html>
       const state = element('span', 'tag');
       const agentStatus = element('span', 'tag agent-status');
       const humanReview = element('span', 'tag human-review', '需要人類 review');
+      const noAutoPickup = element('span', 'tag no-auto-pickup');
+      noAutoPickup.title = '保留手動處理，Symphony 不自動接手；已在執行的 agent 會完成。';
       const title = element('p', 'ticket-title');
       const statuses = element('div', 'ticket-statuses');
       const tags = element('div', 'ticket-tags');
@@ -315,11 +415,11 @@ export const dashboardPage: string = String.raw`<!doctype html>
       session.append(element('summary', '', '接手 session'), command, copyRow);
       topline.append(link, mode);
       statuses.append(state, agentStatus);
-      tags.append(role, humanReview);
+      tags.append(role, humanReview, noAutoPickup);
       times.append(started, completed, blocked);
       root.append(topline, title, statuses, tags, times, session);
       return {
-        root, link, mode, role, state, agentStatus, humanReview, title, tags, times,
+        root, link, mode, role, state, agentStatus, humanReview, noAutoPickup, title, tags, times,
         started, completed, blocked, session, command, copyStatus
       };
     }
@@ -338,7 +438,9 @@ export const dashboardPage: string = String.raw`<!doctype html>
       setText(view.agentStatus, 'Agent · ' + agentLabel);
       view.agentStatus.dataset.status = ticket.agentStatus || '';
       view.humanReview.hidden = !ticket.needsHumanReview;
-      view.tags.hidden = view.role.hidden && view.humanReview.hidden;
+      setText(view.noAutoPickup, ticket.noAutoPickupLabel);
+      view.noAutoPickup.hidden = !ticket.noAutoPickupLabel;
+      view.tags.hidden = view.role.hidden && view.humanReview.hidden && view.noAutoPickup.hidden;
       view.started.hidden = !active || !ticket.startedAt;
       setText(view.started, '開始 ' + formattedDate(ticket.startedAt, dateTime));
       view.completed.hidden = !ticket.completedAt && ticket.column !== 'done';
@@ -419,7 +521,8 @@ export const dashboardPage: string = String.raw`<!doctype html>
       const name = element('h2', 'project-title');
       const repository = element('p', 'repository');
       headingText.append(name, repository);
-      heading.append(headingText, element('span', 'read-only', '唯讀狀態'));
+      const control = createControl(id);
+      heading.append(headingText, control.root);
 
       const ticketSection = element('section', 'section');
       const ticketHeading = element('div', 'section-heading board-heading');
@@ -465,7 +568,7 @@ export const dashboardPage: string = String.raw`<!doctype html>
       historySection.append(historyHeading, historyList);
       panel.append(heading, ticketSection, latestSection, historySection);
       return {
-        tab, tabName, tabCount, panel, name, repository, ticketCount, ticketFreshness, columns,
+        tab, tabName, tabCount, panel, name, repository, control, ticketCount, ticketFreshness, columns,
         latest, maintenanceEmpty, historySection, historyCount, historyList,
         tickets: new Map(), history: new Map()
       };
@@ -535,6 +638,7 @@ export const dashboardPage: string = String.raw`<!doctype html>
     }
 
     function render(data) {
+      lastSnapshot = data;
       const focused = document.activeElement;
       projectOrder = data.projects.map((project) => project.id);
       const ids = new Set(projectOrder);
@@ -559,24 +663,34 @@ export const dashboardPage: string = String.raw`<!doctype html>
       pageEmpty.hidden = data.projects.length > 0;
       setText(pageEmpty, '尚未設定任何專案。');
       if (focused && focused.isConnected && document.activeElement !== focused) focused.focus({ preventScroll: true });
+      updateControls();
     }
 
     async function refresh() {
-      if (refreshing) return;
+      if (refreshing || document.hidden || pendingControl !== null) return;
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
       refreshing = true;
+      const version = controlVersion;
+      let delay = 30000;
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 10000);
       try {
         const response = await fetch('/api/status', { cache: 'no-store', signal: controller.signal });
         if (!response.ok) throw new Error('Status request failed');
         const data = await response.json();
+        if (version !== controlVersion) return;
         if (!data || !Array.isArray(data.projects)) throw new Error('Invalid status response');
         render(data);
+        if (data.projects.some((p) => p.effectivePaused && p.activeAgents > 0)) delay = 1000;
+        failedRefreshes = 0;
         lastUpdatedAt = data.updatedAt;
         connection.dataset.state = 'live';
         setText(connectionLabel, '連線正常');
         setText(connectionDetail, '更新於 ' + formattedDate(lastUpdatedAt, clockTime));
       } catch {
+        delay = retryDelays[Math.min(failedRefreshes, retryDelays.length - 1)];
+        failedRefreshes += 1;
         connection.dataset.state = 'stale';
         setText(connectionLabel, '連線中斷，正在重試');
         setText(connectionDetail, lastUpdatedAt ? '保留 ' + formattedDate(lastUpdatedAt, clockTime) + ' 的狀態' : '尚未取得狀態');
@@ -584,11 +698,16 @@ export const dashboardPage: string = String.raw`<!doctype html>
       } finally {
         clearTimeout(timeout);
         refreshing = false;
+        if (!document.hidden && pendingControl === null) refreshTimer = setTimeout(refresh, delay);
       }
     }
 
+    document.addEventListener('visibilitychange', () => {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
+      if (!document.hidden) refresh();
+    });
     refresh();
-    setInterval(refresh, 5000);
   </script>
 </body>
 </html>`;

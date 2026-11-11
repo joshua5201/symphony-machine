@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import retry from "retry";
 import type { Config, Repo } from "./config.js";
 import { gitConfig, routing } from "./config.js";
 import { GitHub, type PrInfo } from "./github.js";
@@ -20,15 +21,6 @@ type Health = {
   sha: string;
   status: "pending" | "success" | "failure" | "unknown";
   url?: string;
-};
-type Decision = {
-  issueId: string;
-  pr: number;
-  head: string;
-  summary: string;
-  updatedAt: string;
-  prUpdatedAt: string;
-  reviewFingerprint?: string;
 };
 type Sync = {
   id: string;
@@ -63,7 +55,8 @@ export class Machine {
     }
   >();
   private next = new Map<string, number>();
-  private retryAfter = new Map<string, number>();
+  private backoffs = new Map<string, { failures: number; until: number }>();
+  private pauseStates = new Map<string, boolean>();
   private stopping = false;
   constructor(
     public config: Config,
@@ -104,7 +97,6 @@ export class Machine {
     }
     this.config = c;
     this.next.clear();
-    this.retryAfter.clear();
   }
   get activeCount() {
     return this.active.size;
@@ -113,10 +105,18 @@ export class Machine {
     const jobs = this.store.jobs();
     return {
       updatedAt: new Date().toISOString(),
+      paused: this.store.get<boolean>("pause:all") === true,
+      activeAgents: this.activeCount,
+      stopping: this.stopping,
       projects: this.config.repositories.map((r) => ({
         id: r.id,
         name: r.id,
         repository: r.github,
+        paused: this.store.get<boolean>(`pause:${r.id}`) === true,
+        effectivePaused: this.paused(r.id),
+        activeAgents: [...this.active.values()].filter(
+          (a) => a.job.repo === r.id,
+        ).length,
         ticketsUpdatedAt: this.dashboardState.get(r.id)?.updatedAt ?? null,
         ticketsStale: this.dashboardState.get(r.id)?.stale ?? true,
         tickets: this.dashboardTickets(r, jobs),
@@ -232,6 +232,11 @@ export class Machine {
         state,
         needsHumanReview:
           issue?.labels.includes(this.config.linear.needs_human_label) ?? false,
+        noAutoPickupLabel: issue?.labels.includes(
+          this.config.linear.no_auto_pickup_label,
+        )
+          ? this.config.linear.no_auto_pickup_label
+          : null,
         startedAt:
           active?.startedAt ?? issue?.startedAt ?? previous?.startedAt ?? null,
         completedAt: issue?.completedAt ?? null,
@@ -259,36 +264,21 @@ export class Machine {
             ...(j.createdIssueIds ?? []),
           ]),
       );
-      let stale = false;
       for (const id of ids) {
         if (
           issues.has(id) ||
           [...issues.values()].some((issue) => issue.identifier === id)
         )
           continue;
-        try {
-          const issue = await this.linear.getIssue(id);
-          issues.set(issue.id, issue);
-        } catch (error) {
-          stale = true;
-          const retained =
-            previous?.issues.get(id) ??
-            [...(previous?.issues.values() ?? [])].find(
-              (issue) => issue.identifier === id,
-            );
-          if (retained) issues.set(retained.id, retained);
-          this.log("dashboard_poll_error", {
-            repo: r.id,
-            issue: id,
-            error: String(error),
-          });
-        }
+        const issue = await this.linear.getIssue(id);
+        issues.set(issue.id, issue);
       }
       this.dashboardState.set(r.id, {
         issues,
         updatedAt: new Date().toISOString(),
-        stale,
+        stale: false,
       });
+      return true;
     } catch (error) {
       this.dashboardState.set(r.id, {
         issues: previous?.issues ?? new Map(),
@@ -296,11 +286,33 @@ export class Machine {
         stale: true,
       });
       this.log("dashboard_poll_error", { repo: r.id, error: String(error) });
+      return false;
     }
   }
   stop(force = false) {
     this.stopping = true;
     if (force) for (const a of this.active.values()) a.abort.abort();
+  }
+  setPaused(repo: string, paused: boolean) {
+    if (repo !== "all" && !this.config.repositories.some((r) => r.id === repo))
+      throw new Error(`Unknown repository ${repo}`);
+    this.store.set(`pause:${repo}`, paused);
+    this.applyPause();
+    this.log("pause_changed", { repo, paused });
+  }
+  private applyPause() {
+    for (const r of this.config.repositories) {
+      const paused = this.paused(r.id);
+      if (this.pauseStates.get(r.id) !== paused) {
+        this.pauseStates.set(r.id, paused);
+        // Resume on the next poll while retaining external-service backoffs.
+        if (!paused)
+          for (const key of this.next.keys())
+            if (key.startsWith(`${r.id}:`)) this.next.delete(key);
+      }
+    }
+    for (const a of this.active.values())
+      if (this.paused(a.job.repo)) a.abort.abort();
   }
   async drain() {
     await Promise.allSettled([...this.active.values()].map((a) => a.promise));
@@ -321,19 +333,38 @@ export class Machine {
     ).length;
   }
   private due(key: string, seconds: number, now: number) {
+    if (!this.retryReady(key, now)) return false;
     if (now < (this.next.get(key) ?? 0)) return false;
     this.next.set(key, now + seconds * 1000);
     return true;
   }
+  private retryReady(key: string, now: number) {
+    return now >= (this.backoffs.get(key)?.until ?? 0);
+  }
+  private backoff(key: string, seconds: number, now: number) {
+    const failures = (this.backoffs.get(key)?.failures ?? 0) + 1;
+    const retryInMs = retry.createTimeout(failures, {
+      factor: 2,
+      minTimeout: seconds * 1000,
+      maxTimeout: Math.max(seconds * 1000, 15 * 60 * 1000),
+      randomize: true,
+    });
+    const until = now + retryInMs;
+    this.backoffs.set(key, { failures, until });
+    return { failures, retryInMs, retryAt: new Date(until).toISOString() };
+  }
   private paused(repo: string) {
     return (
-      this.store.get<boolean>("pause:all") ||
-      this.store.get<boolean>(`pause:${repo}`)
+      this.store.get<boolean>("pause:all") === true ||
+      this.store.get<boolean>(`pause:${repo}`) === true
     );
   }
-  private skipIssue(issue: LinearIssue) {
+  private dispatchStopped(repo: string) {
+    return this.stopping || this.paused(repo);
+  }
+  private skipIssue(issue: LinearIssue, ready = false) {
     return (
-      issue.labels.includes(this.config.linear.needs_human_label) ||
+      (!ready && issue.labels.includes(this.config.linear.needs_human_label)) ||
       issue.labels.includes(this.config.linear.no_auto_pickup_label)
     );
   }
@@ -381,10 +412,30 @@ export class Machine {
     }
   }
   async tick(now = Date.now()) {
-    await this.flush();
+    // CLI pause flags must interrupt active turns even during sync cooldowns.
+    this.applyPause();
+    const started = Date.now();
+    const completedAt = () => now + Date.now() - started;
+    if (!this.retryReady("outbox", now)) return;
+    try {
+      await this.flush();
+      this.backoffs.delete("outbox");
+    } catch (error) {
+      this.log("sync_error", {
+        error: String(error),
+        ...this.backoff(
+          "outbox",
+          this.config.polling.linear_seconds,
+          completedAt(),
+        ),
+      });
+      return;
+    }
     if (this.stopping) return;
     for (const r of this.config.repositories) {
-      if (!this.paused(r.id) && now >= (this.retryAfter.get(r.id) ?? 0)) {
+      const repositoryPoll = `repo:${r.id}`;
+      if (!this.paused(r.id) && this.retryReady(repositoryPoll, now)) {
+        let interval = this.config.polling.linear_seconds;
         try {
           if (
             this.due(
@@ -392,40 +443,67 @@ export class Machine {
               this.config.polling.master_ci_seconds,
               now,
             )
-          )
+          ) {
+            interval = this.config.polling.master_ci_seconds;
             await this.health(r);
+          }
           if (
             this.due(`${r.id}:github`, this.config.polling.github_seconds, now)
           ) {
+            interval = this.config.polling.github_seconds;
             await this.cleanup(r);
             await this.merge(r);
           }
           if (
             this.due(`${r.id}:review`, this.config.polling.review_seconds, now)
-          )
+          ) {
+            interval = this.config.polling.review_seconds;
             await this.reviews(r);
+          }
           if (
             this.due(`${r.id}:linear`, this.config.polling.linear_seconds, now)
-          )
+          ) {
+            interval = this.config.polling.linear_seconds;
             await this.executions(r);
+          }
+          interval = this.config.polling.linear_seconds;
           await this.maintenance(r, now);
+          this.backoffs.delete(repositoryPoll);
         } catch (error) {
           // A failed poll must remain a gate on subsequent ticks, even when
           // the failed lane's original deadline has not arrived yet.
           for (const key of this.next.keys())
             if (key.startsWith(`${r.id}:`)) this.next.delete(key);
-          this.retryAfter.set(
-            r.id,
-            now + this.config.polling.linear_seconds * 1000,
-          );
-          this.log("poll_error", { repo: r.id, error: String(error) });
+          const snapshot = this.dashboardState.get(r.id);
+          if (snapshot) snapshot.stale = true;
+          this.log("poll_error", {
+            repo: r.id,
+            error: String(error),
+            ...this.backoff(repositoryPoll, interval, completedAt()),
+          });
         }
       }
       if (
         this.config.dashboard.enabled &&
-        this.due(`dashboard:${r.id}`, this.config.polling.linear_seconds, now)
-      )
-        await this.pollDashboard(r);
+        this.retryReady(repositoryPoll, now) &&
+        this.due(
+          `dashboard:${r.id}`,
+          this.config.polling.dashboard_seconds,
+          now,
+        )
+      ) {
+        const key = `dashboard:${r.id}`;
+        if (await this.pollDashboard(r)) this.backoffs.delete(key);
+        else
+          this.log("dashboard_poll_backoff", {
+            repo: r.id,
+            ...this.backoff(
+              key,
+              this.config.polling.dashboard_seconds,
+              completedAt(),
+            ),
+          });
+      }
     }
   }
   private launch(
@@ -433,7 +511,7 @@ export class Machine {
     fn: (signal: AbortSignal) => Promise<void>,
     issue?: LinearIssue,
   ) {
-    if (this.stopping || this.active.has(j.id)) return;
+    if (this.dispatchStopped(j.repo) || this.active.has(j.id)) return;
     j.status = "running";
     this.store.save(j);
     const abort = new AbortController();
@@ -507,6 +585,7 @@ export class Machine {
     return true;
   }
   private async executions(r: Repo) {
+    if (this.dispatchStopped(r.id)) return;
     const c = this.config;
     let issues = await this.linear.listIssues({
       team: r.team,
@@ -536,6 +615,7 @@ export class Machine {
           Number(b.title.startsWith("[Maintenance]")),
     );
     for (const issue of issues) {
+      if (this.dispatchStopped(r.id)) break;
       if (this.count("execution", r.id) >= r.concurrency.execution_tickets)
         break;
       const old = this.job(r.id, issue.id, "execution");
@@ -610,13 +690,13 @@ export class Machine {
     }
   }
   private async reviews(r: Repo) {
-    const pages = await Promise.all(
-      [r.states.review, r.states.ready_to_merge].map((state) =>
-        this.linear.listIssues({ team: r.team, project: r.project, state }),
-      ),
-    );
-    const issues = new Map(pages.flat().map((issue) => [issue.id, issue]));
-    for (let issue of issues.values()) {
+    if (this.dispatchStopped(r.id)) return;
+    const issues = await this.linear.listIssues({
+      team: r.team,
+      project: r.project,
+      state: r.states.review,
+    });
+    for (const issue of issues) {
       if (
         this.count("review", r.id) + this.count("merge", r.id) >=
         r.concurrency.reviews
@@ -641,25 +721,14 @@ export class Machine {
       const old = this.job(r.id, issue.id, "review");
       if (old && this.active.has(old.id)) continue;
       const context = await git.reviewContext(number);
-      let fingerprint = `${pr.head}:${pr.updatedAt}:${issue.updatedAt}:${context.fingerprint}`;
+      const fingerprint = JSON.stringify([
+        pr.head,
+        issue.title,
+        issue.description,
+        issue.labels,
+        context.fingerprint,
+      ]);
       if (old?.fingerprint === fingerprint) continue;
-      if (issue.state === r.states.ready_to_merge) {
-        this.store.set(`merge:${r.id}:${issue.id}`, null);
-        const changedHead = old?.reviewedHead && old.reviewedHead !== pr.head;
-        this.sync({
-          issueId: issue.id,
-          state: changedHead ? r.states.todo : r.states.review,
-          comment: changedHead
-            ? `PR #${number} head changed to ${pr.head}. Lead must verify the current-head delivery evidence and re-handoff to ${r.states.review}; subsequent code review remains incremental.`
-            : `PR #${number} review or ticket context changed. Recheck the PR discussion and required approvals before returning to ${r.states.ready_to_merge}.`,
-        });
-        if (changedHead) continue;
-        await this.flush();
-        issue = await this.linear.getIssue(issue.id);
-        if (issue.state !== r.states.review || this.skipIssue(issue)) continue;
-        fingerprint = `${pr.head}:${pr.updatedAt}:${issue.updatedAt}:${context.fingerprint}`;
-      }
-      this.store.set(`merge:${r.id}:${issue.id}`, null);
       if (pr.checks !== "success") {
         if (pr.checks === "failure")
           this.sync({
@@ -727,31 +796,16 @@ export class Machine {
             return;
           }
           j.reviewedHead = pr.head;
-          j.fingerprint = `${current.head}:${current.updatedAt}:${latestIssue.updatedAt}:${reviewedContext.fingerprint}`;
+          j.fingerprint = JSON.stringify([
+            current.head,
+            latestIssue.title,
+            latestIssue.description,
+            latestIssue.labels,
+            reviewedContext.fingerprint,
+          ]);
           if (result.decision === "ready_to_merge") {
             this.sync({ issueId: issue.id, state: r.states.ready_to_merge });
             await this.flush();
-            const readyIssue = await this.linear.getIssue(issue.id);
-            if (
-              readyIssue.state !== r.states.ready_to_merge ||
-              readyIssue.description !== issue.description ||
-              readyIssue.title !== issue.title ||
-              this.skipIssue(readyIssue)
-            ) {
-              j.fingerprint = undefined;
-              this.store.save(j);
-              return;
-            }
-            j.fingerprint = `${current.head}:${current.updatedAt}:${readyIssue.updatedAt}:${reviewedContext.fingerprint}`;
-            this.store.set(`merge:${r.id}:${issue.id}`, {
-              issueId: issue.id,
-              pr: number,
-              head: pr.head,
-              summary: result.summary,
-              updatedAt: readyIssue.updatedAt,
-              prUpdatedAt: current.updatedAt,
-              reviewFingerprint: reviewedContext.fingerprint,
-            } satisfies Decision);
           } else if (result.decision === "needs_human")
             this.sync({
               issueId: issue.id,
@@ -764,19 +818,20 @@ export class Machine {
               comment: result.summary,
             });
           else if (result.decision === "needs_changes") {
+            j.fingerprint = undefined;
             this.sync({
               issueId: issue.id,
               state: r.states.todo,
               comment: result.summary,
             });
-            this.store.set(`merge:${r.id}:${issue.id}`, null);
-          } else if (result.decision === "blocked")
+          } else if (result.decision === "blocked") {
+            j.fingerprint = undefined;
             this.sync({
               issueId: issue.id,
               state: r.states.blocked,
               comment: result.summary,
             });
-          else throw new Error(`Invalid review decision: ${result.decision}`);
+          } else throw new Error(`Invalid review decision: ${result.decision}`);
           this.store.save(j);
         },
         issue,
@@ -811,43 +866,105 @@ export class Machine {
     });
   }
   private async merge(r: Repo) {
-    if (!r.auto_merge) return;
+    if (!r.auto_merge || this.dispatchStopped(r.id)) return;
     const health = this.store.get<Health>(`health:${r.id}`);
     if (!health) return;
-    const approved = this.store
-      .jobs()
-      .filter(
-        (j) => j.repo === r.id && j.role === "review" && j.status === "done",
+    // Linear Ready is the handoff, including a human's completed review.
+    // SQLite retains the order for recovery, never a second approval gate.
+    const ready = await this.linear.listIssues({
+      team: r.team,
+      project: r.project,
+      state: r.states.ready_to_merge,
+    });
+    const candidates: {
+      issueId: string;
+      identifier: string;
+      pr: number;
+      head: string;
+    }[] = [];
+    let plan = this.store.get<{
+      signature: string;
+      order: string[];
+      candidates?: typeof candidates;
+    } | null>(`merge_plan:${r.id}`);
+    for (const issue of ready) {
+      if (
+        this.skipIssue(issue, true) ||
+        [...this.active.values()].some((a) => a.job.issueId === issue.id)
       )
-      .map((j) => ({
-        job: j,
-        decision: this.store.get<Decision | null>(`merge:${r.id}:${j.issueId}`),
-      }))
-      .filter((x) => x.decision);
-    const candidates: typeof approved = [];
-    for (const candidate of approved) {
-      const issue = await this.linear.getIssue(candidate.decision!.issueId);
-      if (issue.state === r.states.ready_to_merge && !this.skipIssue(issue))
-        candidates.push(candidate);
+        continue;
+      const execution = this.job(r.id, issue.id, "execution");
+      const linked = issue.prUrls
+        .map((url) =>
+          url.match(
+            new RegExp(
+              `^https://github\\.com/${r.github.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/pull/(\\d+)(?:[/?#]|$)`,
+            ),
+          ),
+        )
+        .find(Boolean);
+      const number =
+        execution?.prNumber ?? (linked ? Number(linked[1]) : undefined);
+      if (!number) continue;
+      const pr = await this.githubFactory(r).pr(number);
+      if (pr.state === "MERGED") {
+        await this.merged(r, issue, pr);
+        continue;
+      }
+      if (pr.state !== "OPEN" || pr.base !== r.branch || pr.draft) continue;
+      // Pin the head already handed to planning, even while new CI is pending.
+      // A fresh Ready handoff needs no local review/approval record.
+      const planned = plan?.candidates?.find(
+        (candidate) => candidate.issueId === issue.id,
+      );
+      if (planned && planned.head !== pr.head) {
+        this.sync({
+          issueId: issue.id,
+          state: r.states.todo,
+          labels: issue.labels.filter(
+            (label) => label !== this.config.linear.needs_human_label,
+          ),
+          comment: `PR #${number} head changed after merge planning started. Lead must verify affected changes at ${pr.head} and return to ${r.states.review}.`,
+        });
+        this.store.set(`merge_plan:${r.id}`, null);
+        plan = null;
+        continue;
+      }
+      if (pr.mergeable === "CONFLICTING" || pr.checks === "failure") {
+        this.sync({
+          issueId: issue.id,
+          state: r.states.todo,
+          labels: issue.labels.filter(
+            (label) => label !== this.config.linear.needs_human_label,
+          ),
+          comment:
+            pr.mergeable === "CONFLICTING"
+              ? `PR #${number} conflicts with ${r.branch}. Lead must resolve conflicts in the existing branch/PR and verify affected changes before returning to ${r.states.review}.`
+              : `PR #${number} CI failed on ${pr.head}; Lead must inspect and repair the failure in the existing branch/PR.`,
+        });
+        continue;
+      }
+      if (pr.mergeable !== "MERGEABLE" || pr.checks !== "success") continue;
+      if (!(await this.dependenciesReady(issue, r))) continue;
+      candidates.push({
+        issueId: issue.id,
+        identifier: issue.identifier,
+        pr: number,
+        head: pr.head,
+      });
     }
     candidates.sort(
       (a, b) =>
-        Number(b.decision!.issueId === this.store.get(`repair:${r.id}`)) -
-          Number(a.decision!.issueId === this.store.get(`repair:${r.id}`)) ||
-        a.job.startedAt.localeCompare(b.job.startedAt),
+        Number(b.issueId === this.store.get(`repair:${r.id}`)) -
+          Number(a.issueId === this.store.get(`repair:${r.id}`)) ||
+        a.identifier.localeCompare(b.identifier),
     );
-    const signature = JSON.stringify(
-      candidates.map((x) => [
-        x.decision!.issueId,
-        x.decision!.head,
-        x.decision!.updatedAt,
-      ]),
-    );
-    if (!candidates.length) return;
-    const plan = this.store.get<{ signature: string; order: string[] }>(
-      `merge_plan:${r.id}`,
-    );
-    if (plan?.signature !== signature || !plan.order.length) {
+    const signature = JSON.stringify(candidates);
+    if (!candidates.length) {
+      if (!ready.length) this.store.set(`merge_plan:${r.id}`, null);
+      return;
+    }
+    if (plan?.signature !== signature) {
       if (
         [...this.active.values()].some(
           (a) => a.job.repo === r.id && a.job.role === "merge",
@@ -859,17 +976,26 @@ export class Machine {
         r.concurrency.reviews
       )
         return;
-      const j = this.create(
-        r,
-        { id: `merge:${r.id}`, identifier: `merge:${r.id}` },
-        "merge",
-      );
+      const pending = this.store
+        .jobs()
+        .findLast(
+          (j) =>
+            j.repo === r.id && j.role === "merge" && j.status === "waiting",
+        );
+      const j =
+        pending ??
+        this.create(
+          r,
+          { id: `merge:${r.id}`, identifier: `merge:${r.id}` },
+          "merge",
+        );
       this.launch(j, async (signal) => {
         const response = await this.runner.run({
+          threadId: j.threadId,
           cwd: r.path,
           title: `${r.id} · Merge planning`,
           developerInstructions: contract(this.config, r),
-          prompt: `${contract(this.config, r)}\nYou are the Merge planning agent, separate from the programmatic coordinator that executes merges. Decide which independently reviewed ${r.states.ready_to_merge} candidates should merge this round and in which order. Read related Linear issues and relevant PR changes as needed. Prioritize CI repair, dependencies and product priorities. Assess overlap and concrete integration risks between these changes (interfaces, data/migrations, shared behavior and delivery order as applicable); do not repeat the independent code review or introduce style/extra-scope requirements. If a candidate needs actionable work or has an identified unavailable prerequisite, record a concise finding and PR evidence link on its Linear ticket and return it to ${r.states.todo} or ${r.states.blocked} respectively; human decision blockers also need an explicit escalation and ${this.config.linear.needs_human_label}. Normal pending CI is polled by the coordinator, not a reason to mark Blocked. Do not merge or edit code. Return decision done and issueIds in merge order (a subset is permitted), with rationale in summary. Candidates: ${JSON.stringify(candidates.map((x) => x.decision))}`,
+          prompt: `${contract(this.config, r)}\nYou are the Merge planning agent, separate from the programmatic coordinator that executes merges. Linear ${r.states.ready_to_merge} is the authoritative completed-review handoff, including when needs-human remains. Decide which ${r.states.ready_to_merge} candidates should merge this round and in which order. Read related Linear issues and relevant PR changes as needed. Prioritize CI repair, dependencies and product priorities. Assess overlap and concrete integration risks between these changes (interfaces, data/migrations, shared behavior and delivery order as applicable); do not repeat the independent code review or introduce style/extra-scope requirements. If a candidate needs actionable work or has an identified unavailable prerequisite, record a concise finding and PR evidence link on its Linear ticket and return it to ${r.states.todo} or ${r.states.blocked} respectively; human decision blockers also need an explicit escalation and ${this.config.linear.needs_human_label}. Normal pending CI is polled by the coordinator, not a reason to mark Blocked. Do not merge, update/rebase branches, resolve conflicts, or edit code. Conflicts return to Todo for the original Lead. When returning Ready work to Todo, remove the resolved needs-human label so it can resume; retain it only for a new unresolved human question. Do not repeat review based on timestamps or missing local approval records. Return decision done and issueIds in merge order (a subset is permitted), with rationale in summary. Candidates: ${JSON.stringify(candidates)}`,
           ...this.config.codex.review,
           signal,
           onThread: (id) => {
@@ -877,6 +1003,11 @@ export class Machine {
             this.store.save(j);
           },
         });
+        if (response.outcome === "interrupted") {
+          j.status = "waiting";
+          this.store.save(j);
+          return;
+        }
         if (
           response.outcome !== "completed" ||
           response.result?.decision !== "done"
@@ -889,14 +1020,12 @@ export class Machine {
         const order = response.result.issueIds ?? [];
         if (
           new Set(order).size !== order.length ||
-          order.some(
-            (id) => !candidates.some((x) => x.decision!.issueId === id),
-          )
+          order.some((id) => !candidates.some((x) => x.issueId === id))
         )
           throw new Error(
             "Merge planner returned unknown or duplicate candidates",
           );
-        this.store.set(`merge_plan:${r.id}`, { signature, order });
+        this.store.set(`merge_plan:${r.id}`, { signature, order, candidates });
         j.status = "done";
         j.summary = response.result.summary;
         this.store.save(j);
@@ -904,13 +1033,10 @@ export class Machine {
       return;
     }
     candidates.sort(
-      (a, b) =>
-        plan.order.indexOf(a.decision!.issueId) -
-        plan.order.indexOf(b.decision!.issueId),
+      (a, b) => plan.order.indexOf(a.issueId) - plan.order.indexOf(b.issueId),
     );
-    for (const { job, decision: d } of candidates) {
+    for (const d of candidates) {
       if (
-        !d ||
         !plan.order.includes(d.issueId) ||
         [...this.active.values()].some((a) => a.job.issueId === d.issueId)
       )
@@ -924,7 +1050,7 @@ export class Machine {
       const issue = await this.linear.getIssue(d.issueId);
       if (
         issue.state !== r.states.ready_to_merge ||
-        this.skipIssue(issue) ||
+        this.skipIssue(issue, true) ||
         !(await this.dependenciesReady(issue, r))
       )
         continue;
@@ -934,59 +1060,28 @@ export class Machine {
         await this.merged(r, issue, pr);
         continue;
       }
-      const context = await git.reviewContext(d.pr);
       if (
         pr.state !== "OPEN" ||
-        pr.head !== d.head ||
-        pr.updatedAt !== d.prUpdatedAt ||
-        issue.updatedAt !== d.updatedAt ||
-        context.fingerprint !== d.reviewFingerprint
-      ) {
-        this.store.set(`merge:${r.id}:${issue.id}`, null);
-        job.fingerprint = undefined;
-        this.store.save(job);
+        pr.base !== r.branch ||
+        pr.draft ||
+        pr.head !== d.head
+      )
+        continue;
+      if (pr.mergeable === "CONFLICTING" || pr.checks === "failure") {
         this.sync({
           issueId: issue.id,
-          state: pr.head !== d.head ? r.states.todo : r.states.review,
+          state: r.states.todo,
+          labels: issue.labels.filter(
+            (label) => label !== this.config.linear.needs_human_label,
+          ),
           comment:
-            pr.head !== d.head
-              ? `PR #${d.pr} head changed to ${pr.head}. Lead must refresh required delivery evidence, then request incremental review on the existing PR.`
-              : `PR #${d.pr} review or ticket context changed; the previous merge permission is invalid. Recheck the PR discussion before ${r.states.ready_to_merge}.`,
+            pr.mergeable === "CONFLICTING"
+              ? `PR #${d.pr} conflicts with ${r.branch}. Lead must resolve conflicts in the existing branch/PR and verify affected changes before returning to ${r.states.review}.`
+              : `PR #${d.pr} CI failed on ${pr.head}; Lead must inspect and repair the failure in the existing branch/PR.`,
         });
         continue;
       }
-      const updated = await git.updateBranch(d.pr);
-      if (updated === "conflict") {
-        this.sync({
-          issueId: issue.id,
-          state: r.states.todo,
-          comment: `PR #${d.pr} conflicts with ${r.branch}. Resume the existing branch/PR, resolve conflicts, and reverify.`,
-        });
-        this.store.set(`merge:${r.id}:${issue.id}`, null);
-        return;
-      }
-      const fresh = await git.pr(d.pr);
-      if (updated === "updated" || fresh.head !== d.head) {
-        job.fingerprint = undefined;
-        this.store.save(job);
-        this.store.set(`merge:${r.id}:${issue.id}`, null);
-        this.sync({
-          issueId: issue.id,
-          state: r.states.todo,
-          comment: `Coordinator updated PR #${d.pr} from ${d.head} to ${fresh.head}. Lead must verify required current-head CI, deployment and affected smoke evidence in the existing branch/PR, then re-handoff to ${r.states.review}. Code review remains incremental from the last reviewed head.`,
-        });
-        return;
-      }
-      if (fresh.checks === "failure") {
-        this.sync({
-          issueId: issue.id,
-          state: r.states.todo,
-          comment: `PR #${d.pr} CI failed on ${fresh.head}; inspect the failed checks and repair within the existing contract.`,
-        });
-        this.store.set(`merge:${r.id}:${issue.id}`, null);
-        return;
-      }
-      if (fresh.checks !== "success") return;
+      if (pr.mergeable !== "MERGEABLE" || pr.checks !== "success") continue;
       // Refresh target health immediately before merging; an earlier poll is not authorization.
       const latest = await git.masterHealth();
       this.store.set(`health:${r.id}`, latest);
@@ -996,6 +1091,7 @@ export class Machine {
       )
         return;
       if (latest.sha !== health.sha) return; // Re-evaluate integration after a moving target.
+      if (this.dispatchStopped(r.id)) return;
       await git.merge(d.pr, d.head);
       const merged = await git.pr(d.pr);
       if (merged.state !== "MERGED")
@@ -1010,7 +1106,7 @@ export class Machine {
       throw new Error(
         "Merged PR does not target the configured integration branch",
       );
-    this.store.set(`merge:${r.id}:${issue.id}`, null);
+
     const j = this.job(r.id, issue.id, "execution");
     if (j?.workspace) {
       j.prNumber = pr.number;
@@ -1063,6 +1159,7 @@ export class Machine {
   private async maintenance(r: Repo, now: number) {
     const c = this.config;
     if (
+      this.dispatchStopped(r.id) ||
       !c.maintenance.enabled ||
       this.count("maintenance", r.id) >= r.concurrency.maintenance_scans
     )

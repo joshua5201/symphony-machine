@@ -568,26 +568,6 @@ test("master health requires configured workflows on the exact remote target SHA
   assert.equal((await github.masterHealth()).status, "pending");
 });
 
-test("updateBranch reports current, updated, and conflict without hiding service errors", async (t) => {
-  let pr = rawPr("before");
-  let update: "current" | "updated" | "error" = "current";
-  const f = await fixture(t, (args) => {
-    if (args[1] === "view") return okay(JSON.stringify(pr));
-    if (update === "error")
-      return { code: 1, stdout: "", stderr: "network unavailable" };
-    if (update === "updated") pr = rawPr("after");
-    return okay();
-  });
-  assert.equal(await f.github.updateBranch(7), "current");
-  update = "updated";
-  assert.equal(await f.github.updateBranch(7), "updated");
-  pr = rawPr("after", undefined, { mergeable: "CONFLICTING" });
-  assert.equal(await f.github.updateBranch(7), "conflict");
-  pr = rawPr("after");
-  update = "error";
-  await assert.rejects(f.github.updateBranch(7), /network unavailable/);
-});
-
 const androidWorkflows = [
   {
     name: "Android debug artifacts",

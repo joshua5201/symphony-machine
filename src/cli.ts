@@ -93,7 +93,11 @@ async function main() {
     if (repo !== "all" && !config.repositories.some((r) => r.id === repo))
       throw new Error(`Unknown repository ${repo}`);
     store.set(`pause:${repo}`, command === "pause");
-    console.log(`${command}: ${repo} (active agents are not interrupted)`);
+    console.log(
+      command === "pause"
+        ? `pause: ${repo} (the runner will interrupt active agents on its next poll)`
+        : `resume: ${repo} (work continues on the runner's next poll)`,
+    );
     store.close();
     return;
   }
@@ -171,9 +175,11 @@ async function main() {
       if (e.method !== "turn/completed") return;
       const threadId = e.params?.threadId;
       const job = threadId
-        ? store.jobs().find(
-            (j) => j.threadId === threadId || j.workerThreadId === threadId,
-          )
+        ? store
+            .jobs()
+            .find(
+              (j) => j.threadId === threadId || j.workerThreadId === threadId,
+            )
         : undefined;
       log("codex_turn_completed", {
         job: job?.id,
@@ -242,8 +248,10 @@ async function main() {
     process.on("SIGTERM", onSignal);
     if (config.dashboard.enabled) {
       const runningMachine = machine;
-      dashboard = await startDashboard(config.dashboard, () =>
-        runningMachine.dashboard(),
+      dashboard = await startDashboard(
+        config.dashboard,
+        () => runningMachine.dashboard(),
+        (repo, paused) => runningMachine.setPaused(repo, paused),
       );
       log("dashboard_listening", { url: dashboard.url });
     }

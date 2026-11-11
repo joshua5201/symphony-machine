@@ -10,8 +10,8 @@ A personal, foreground workflow runner. The repository is public; the runtime an
 - Use execFile/spawn argument arrays, never interpolate issue content into shell commands.
 - No bypass of branch protection. Merge only the reviewed head into the configured target. Cleanup only owned resources after verified merge, with no active agent or dirty worktree.
 - Execution may not change requirements or silently grant human approval. Escalate through Linear. Automated maintenance must follow the configured policy.
-- Keep implementations proportional to this single-user system. No speculative distributed queues, public API, multi-tenant auth, or product UI beyond the read-only dashboard.
-- Keep the dashboard in the foreground runner's Node process. It has no workflow mutation routes, login or application authentication. Bind to loopback by default; LAN bind settings and Tailscale Serve belong to private local configuration.
+- Keep implementations proportional to this single-user system. No speculative distributed queues, public API, multi-tenant auth, or product UI beyond the dashboard and its pause/resume controls.
+- Keep the dashboard in the foreground runner's Node process. Its only control route pauses/resumes runner work; it has no ticket-editing routes, login or application authentication. Bind to loopback by default; LAN bind settings and Tailscale Serve belong to private local configuration.
 - Dashboard columns reflect Linear state, separately from agent status. Show completion/blocked timestamps only from Linear evidence; unknown historical times stay unknown. Keep ticket projections in memory and use SQLite execution references for history, not a second requirements store.
 - Render ticket titles and findings as text, accept only HTTP(S) links, and keep resume commands shell-quoted and copy-only. Use project tabs, desktop Kanban and vertically stacked phone sections; preserve maintenance history and session disclosures during polling.
 - Never restart or interrupt a live runner merely to apply dashboard edits or publish source. Leave process lifecycle actions to explicit user authorization.

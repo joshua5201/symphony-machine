@@ -639,33 +639,6 @@ export class GitHub {
       );
   }
 
-  async updateBranch(
-    number: number,
-  ): Promise<"updated" | "current" | "conflict"> {
-    const before = await this.pr(number);
-    this.assertTarget(before);
-    if (before.state !== "OPEN")
-      throw new Error("Only open pull requests can be updated");
-    if (before.mergeable === "CONFLICTING") return "conflict";
-    const result = await this.runner(
-      "gh",
-      ["pr", "update-branch", String(number), "--repo", this.repo.github],
-      this.repo.path,
-    );
-    if (result.code !== 0) {
-      if (
-        /cannot update PR branch due to conflicts|merge conflict between base and head/i.test(
-          result.stderr + result.stdout,
-        )
-      )
-        return "conflict";
-      throw new Error(
-        `Cannot update PR branch: ${(result.stderr || result.stdout).trim()}`,
-      );
-    }
-    return (await this.pr(number)).head === before.head ? "current" : "updated";
-  }
-
   async merge(number: number, expectedHead: string): Promise<void> {
     const pr = await this.pr(number);
     this.assertTarget(pr);

@@ -23,10 +23,11 @@ codex:
   maintenance: { model: gpt-6.1-sol, reasoning: xhigh }
 
 polling:
-  linear_seconds: 30
-  review_seconds: 60
-  github_seconds: 30
-  master_ci_seconds: 60
+  linear_seconds: 120
+  review_seconds: 180
+  github_seconds: 120
+  master_ci_seconds: 300
+  dashboard_seconds: 300 # Linear snapshot; browser reads local state every 30 seconds.
 
 maintenance:
   enabled: true

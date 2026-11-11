@@ -81,7 +81,8 @@ class FakeLinear {
     return [...this.issues.values()]
       .filter((value) => !filter.team || (value.team ?? "Demo") === filter.team)
       .filter(
-        (value) => !filter.project || (value.project ?? "Project") === filter.project,
+        (value) =>
+          !filter.project || (value.project ?? "Project") === filter.project,
       )
       .filter((value) => !filter.state || value.state === filter.state)
       .map((value) => structuredClone(value));
@@ -100,7 +101,9 @@ class FakeLinear {
     assert.ok(value);
     if (patch.state) value.state = patch.state;
     if (patch.labels) value.labels = patch.labels;
-    value.updatedAt = new Date(Date.parse(value.updatedAt) + 1000).toISOString();
+    value.updatedAt = new Date(
+      Date.parse(value.updatedAt) + 1000,
+    ).toISOString();
   }
   async comment(id: string, body: string): Promise<void> {
     this.comments.push({ id, body });
@@ -137,7 +140,9 @@ class FakeCodex {
 
 class FakeGitHub {
   target = "master-sha";
-  async targetCommit() { return this.target; }
+  async targetCommit() {
+    return this.target;
+  }
   prs = new Map<number, PrInfo>();
   reviewFingerprints = new Map<number, string>();
   prepares: string[] = [];
@@ -164,7 +169,9 @@ class FakeGitHub {
   async reviewContext(number: number) {
     return {
       fingerprint: this.reviewFingerprints.get(number) ?? `context-${number}`,
-      reviews: [], comments: [], inlineComments: [],
+      reviews: [],
+      comments: [],
+      inlineComments: [],
     };
   }
   async findPr(branch: string) {
@@ -174,9 +181,6 @@ class FakeGitHub {
   }
   async masterHealth() {
     return { sha: "master-sha", status: "success" as const };
-  }
-  async updateBranch() {
-    return "current" as const;
   }
   async merge(number: number) {
     this.merges.push(number);
@@ -242,7 +246,10 @@ async function fixture(
     if (task?.state === "Todo") task.state = "In Progress";
   });
   const githubs = new Map(
-    config.repositories.map((repo) => [repo.id, new FakeGitHub(repo.worktree_root!)]),
+    config.repositories.map((repo) => [
+      repo.id,
+      new FakeGitHub(repo.worktree_root!),
+    ]),
   );
   const githubFor = (id: string) => {
     const github = githubs.get(id);
@@ -308,9 +315,15 @@ test("maintenance rotates directions with independent successful commit checkpoi
     f.github.target = `commit-${index}`;
     await f.machine.tick(now);
     await until(() => f.codex.runs.length === index + 1);
-    const job = f.store.jobs().findLast(j => j.role === "maintenance")!;
-    assert.deepEqual(job.maintenance, { direction: direction.id, to: `commit-${index}` });
-    f.codex.runs[index].finish({ outcome: "completed", result: { decision: "done", summary: "No justified findings." } });
+    const job = f.store.jobs().findLast((j) => j.role === "maintenance")!;
+    assert.deepEqual(job.maintenance, {
+      direction: direction.id,
+      to: `commit-${index}`,
+    });
+    f.codex.runs[index].finish({
+      outcome: "completed",
+      result: { decision: "done", summary: "No justified findings." },
+    });
     await f.machine.drain();
     now += interval;
   }
@@ -319,9 +332,13 @@ test("maintenance rotates directions with independent successful commit checkpoi
   await f.machine.tick(now);
   await until(() => f.codex.runs.length === maintenanceDirections.length + 1);
   assert.deepEqual(f.store.jobs().at(-1)!.maintenance, {
-    direction: maintenanceDirections[0].id, from: "commit-0", to: "new-head",
+    direction: maintenanceDirections[0].id,
+    from: "commit-0",
+    to: "new-head",
   });
-  f.codex.runs.at(-1)!.finish({ outcome: "failed", error: "Investigation incomplete" });
+  f.codex.runs
+    .at(-1)!
+    .finish({ outcome: "failed", error: "Investigation incomplete" });
   await f.machine.drain();
   now += interval;
   // Other directions retain their own checkpoints and skip unchanged heads
@@ -332,17 +349,29 @@ test("maintenance rotates directions with independent successful commit checkpoi
     await f.machine.tick(now);
     await f.machine.drain();
     assert.equal(f.codex.runs.length, runs);
-    assert.equal(f.store.jobs().at(-1)!.maintenance!.direction, maintenanceDirections[index].id);
+    assert.equal(
+      f.store.jobs().at(-1)!.maintenance!.direction,
+      maintenanceDirections[index].id,
+    );
     now += interval;
   }
   f.restart();
   f.github.target = "newer-head";
   await f.machine.tick(now);
   await until(() => f.codex.runs.length === runs + 1);
-  assert.deepEqual(f.store.jobs().at(-1)!.maintenance, {
-    direction: maintenanceDirections[0].id, from: "commit-0", to: "newer-head",
-  }, "failed investigation must not advance its checkpoint");
-  f.codex.runs.at(-1)!.finish({ outcome: "completed", result: { decision: "done", summary: "Complete." } });
+  assert.deepEqual(
+    f.store.jobs().at(-1)!.maintenance,
+    {
+      direction: maintenanceDirections[0].id,
+      from: "commit-0",
+      to: "newer-head",
+    },
+    "failed investigation must not advance its checkpoint",
+  );
+  f.codex.runs.at(-1)!.finish({
+    outcome: "completed",
+    result: { decision: "done", summary: "Complete." },
+  });
   await f.machine.drain();
 });
 
@@ -362,7 +391,10 @@ test("interrupted maintenance resumes the same direction, commit range and threa
   assert.equal(resumed.id, original.id);
   assert.deepEqual(resumed.maintenance, original.maintenance);
   assert.equal(f.codex.runs[1].input.threadId, original.threadId);
-  f.codex.runs[1].finish({ outcome: "completed", result: { decision: "done", summary: "Completed pinned snapshot." } });
+  f.codex.runs[1].finish({
+    outcome: "completed",
+    result: { decision: "done", summary: "Completed pinned snapshot." },
+  });
   await f.machine.drain();
   assert.equal(f.store.jobs().at(-1)!.maintenance!.to, "master-sha");
 });
@@ -389,7 +421,8 @@ test("maintenance capacity and idle checks apply independently to each repositor
   f.githubFor("other").prs.set(2, otherPr);
   await f.machine.tick(1_000);
   await until(() => f.codex.runs.length === 3);
-  const running = () => f.store.jobs().filter((job) => job.status === "running");
+  const running = () =>
+    f.store.jobs().filter((job) => job.status === "running");
   const scanning = () =>
     running()
       .filter((job) => job.role === "maintenance")
@@ -556,7 +589,8 @@ test("repository execution limits are independent and hot changes preserve activ
   other.concurrency.execution_tickets = 3;
   await f.machine.tick(1_000);
   await until(() => f.codex.runs.length === 5);
-  const running = () => f.store.jobs().filter((job) => job.status === "running");
+  const running = () =>
+    f.store.jobs().filter((job) => job.status === "running");
   assert.equal(f.machine.activeCount, 5);
   assert.equal(running().filter((job) => job.repo === demo.id).length, 2);
   assert.equal(running().filter((job) => job.repo === other.id).length, 3);
@@ -666,7 +700,9 @@ test("execution invokes the original skill with headless repository and worktree
   assert.match(input.prompt, /\$symphony-execute[\s\S]*ENG-1/);
   assert.match(input.prompt, /headless/i);
   assert.match(input.prompt, /symphony-execute[/\\]SKILL\.md/);
-  const skill = input.skills?.find((value) => value.name === "symphony-execute");
+  const skill = input.skills?.find(
+    (value) => value.name === "symphony-execute",
+  );
   assert.ok(skill);
   assert.ok(input.prompt.includes(skill.path));
   assert.ok(instructions.includes(f.config.codex.workflow));
@@ -711,6 +747,154 @@ test("interrupted execution persists waiting and resumes the same thread and wor
   await f.machine.drain();
   assert.equal(f.store.jobs()[0].status, "done");
   assert.equal(f.linear.issues.get(task.id)?.state, "In Review");
+});
+
+test("project and global pause preserve sessions, repository flags and worktrees across restart", async (t) => {
+  const task = issue(1);
+  const otherTask = issue(2, { team: "Other", project: "Other Project" });
+  const queued = issue(3);
+  const f = await fixture(
+    t,
+    [task, otherTask, queued],
+    [{ id: "other", team: "Other", project: "Other Project" }],
+  );
+  f.config.repositories[0].concurrency.execution_tickets = 1;
+  await f.machine.tick(1_000);
+  await until(() => f.codex.runs.length === 2);
+  const original = f.store.jobs().find((j) => j.issueId === task.id)!;
+  const other = f.store.jobs().find((j) => j.issueId === otherTask.id)!;
+  f.machine.setPaused("demo", true);
+  await until(() => f.machine.activeCount === 1);
+  assert.equal(
+    f.store.jobs().find((j) => j.id === original.id)!.status,
+    "waiting",
+  );
+  assert.equal(f.codex.runs[1].input.signal?.aborted, false);
+  await f.machine.tick(1_001);
+  assert.equal(f.codex.runs.length, 2, "queued work stays unclaimed");
+  const paused = f.machine.dashboard().projects.find((p) => p.id === "demo")!;
+  assert.equal(paused.paused, true);
+  assert.equal(paused.effectivePaused, true);
+  assert.equal(paused.activeAgents, 0);
+
+  f.machine.setPaused("all", true);
+  await f.machine.drain();
+  f.restart();
+  await f.machine.tick(1_002);
+  assert.equal(f.machine.dashboard().paused, true);
+  assert.equal(f.codex.runs.length, 2);
+  f.machine.setPaused("all", false);
+  await f.machine.tick(1_003);
+  await until(() => f.codex.runs.length === 3);
+  assert.equal(f.codex.runs[2].input.threadId, other.threadId);
+  assert.equal(f.machine.dashboard().projects[0].effectivePaused, true);
+
+  // Reserve the queued ticket so the existing scheduling order leaves room
+  // for the interrupted execution when this repository resumes.
+  f.linear.issues.get(queued.id)!.labels = ["no-auto-pickup"];
+  f.machine.setPaused("demo", false);
+  await f.machine.tick(1_004);
+  await until(() => f.codex.runs.length === 4);
+  assert.equal(f.codex.runs[3].input.threadId, original.threadId);
+  assert.deepEqual(
+    f.store.jobs().find((j) => j.id === original.id)!.workspace,
+    original.workspace,
+  );
+  assert.deepEqual(f.github.prepares, [task.identifier]);
+  assert.deepEqual(f.linear.updates, []);
+  assert.deepEqual(f.linear.comments, []);
+  assert.equal(f.linear.issues.get(task.id)!.state, "In Progress");
+});
+
+for (const role of ["review", "merge", "maintenance"] as const) {
+  test(`pause interrupts ${role} and resume reuses its job and thread`, async (t) => {
+    const task = issue(1, {
+      state: role === "merge" ? "Ready to merge" : "In Review",
+      prUrls: [pr(1).url],
+    });
+    const f = await fixture(t, role === "maintenance" ? [] : [task]);
+    f.github.prs.set(1, pr(1));
+    f.config.repositories[0].auto_merge = role === "merge";
+    f.config.maintenance.enabled = role === "maintenance";
+    await f.machine.tick(1_000);
+    await until(() => f.codex.runs.length === 1);
+    const original = f.store.jobs().find((j) => j.status === "running")!;
+    assert.equal(original.role, role);
+    f.machine.setPaused("all", true);
+    await f.machine.drain();
+    const interrupted = f.store.jobs().find((j) => j.id === original.id)!;
+    assert.equal(interrupted.status, "waiting");
+    if (role === "review") assert.equal(interrupted.fingerprint, undefined);
+    await f.machine.tick(1_001);
+    assert.equal(f.codex.runs.length, 1);
+    f.machine.setPaused("all", false);
+    await f.machine.tick(1_002);
+    await until(() => f.codex.runs.length === 2);
+    assert.equal(f.codex.runs[1].input.threadId, original.threadId);
+    assert.equal(f.store.jobs().filter((j) => j.role === role).length, 1);
+    assert.deepEqual(
+      f.store.jobs().find((j) => j.id === original.id)!.maintenance,
+      original.maintenance,
+    );
+  });
+}
+
+test("CLI pause flags interrupt active turns even while outbox synchronization is cooling down", async (t) => {
+  const task = issue(1);
+  const f = await fixture(t, [task]);
+  await f.machine.tick(1_000);
+  await until(() => f.codex.runs.length === 1);
+  f.store.set("outbox", [
+    { id: "pending", issueId: task.id, state: "In Progress" },
+  ]);
+  const update = f.linear.updateIssue.bind(f.linear);
+  f.linear.updateIssue = async () => {
+    throw new Error("Linear unavailable");
+  };
+  await f.machine.tick(2_000);
+  assert.equal(f.machine.activeCount, 1);
+  f.store.set("pause:all", true);
+  await f.machine.tick(2_001);
+  await until(() => f.machine.activeCount === 0);
+  assert.equal(f.store.jobs()[0].status, "waiting");
+  assert.equal(f.machine.dashboard().paused, true);
+  f.linear.updateIssue = update;
+});
+
+test("pause during a repository read prevents the resulting agent dispatch", async (t) => {
+  const f = await fixture(t, [issue(1)]);
+  const list = f.linear.listIssues.bind(f.linear);
+  f.linear.listIssues = async (filter) => {
+    const issues = await list(filter);
+    if (filter.state === "Todo") f.machine.setPaused("demo", true);
+    return issues;
+  };
+  await f.machine.tick(1_000);
+  assert.equal(f.codex.runs.length, 0);
+  assert.equal(f.store.jobs().length, 0);
+});
+
+test("pause before the final merge command preserves the ready PR", async (t) => {
+  const task = issue(1, { state: "Ready to merge", prUrls: [pr(1).url] });
+  const f = await fixture(t, [task]);
+  f.config.repositories[0].auto_merge = true;
+  f.config.polling.master_ci_seconds = 300;
+  f.github.prs.set(1, pr(1));
+  await f.machine.tick(1_000);
+  await until(() => f.codex.runs.length === 1);
+  f.codex.runs[0].finish({
+    outcome: "completed",
+    result: { decision: "done", summary: "Merge ready", issueIds: [task.id] },
+  });
+  await f.machine.drain();
+  const health = f.github.masterHealth.bind(f.github);
+  f.github.masterHealth = async () => {
+    f.machine.setPaused("demo", true);
+    return health();
+  };
+  await f.machine.tick(2_000);
+  assert.deepEqual(f.github.merges, []);
+  assert.equal(f.github.prs.get(1)!.state, "OPEN");
 });
 
 test("startup recovery resumes an execution left running in SQLite instead of creating another job", async (t) => {
@@ -824,53 +1008,80 @@ test("merged cleanup waits until an active review for the same issue has finishe
   await f.machine.tick(5_000);
   await f.machine.flush();
   assert.deepEqual(f.github.cleanups, [1]);
-  assert.equal(f.store.jobs().find((job) => job.role === "execution")!.prNumber, 1);
+  assert.equal(
+    f.store.jobs().find((job) => job.role === "execution")!.prNumber,
+    1,
+  );
   assert.equal(f.linear.issues.get(task.id)?.state, "In Review");
   await f.machine.tick(7_000);
   assert.deepEqual(f.github.cleanups, [1], "completed cleanup is not repeated");
 });
 
-test("a merge decision made before a ticket update cannot authorize merging the unchanged PR head", async (t) => {
+test("Linear Ready hands ordinary and human-reviewed work to merge without local approval records", async (t) => {
+  for (const labels of [[], ["needs-human"]]) {
+    await t.test(
+      labels.length ? "human review" : "ordinary review",
+      async (t) => {
+        const task = issue(1, {
+          state: "Ready to merge",
+          labels,
+          prUrls: [pr(1).url],
+        });
+        const f = await fixture(t, [task]);
+        f.config.repositories[0].auto_merge = true;
+        f.github.prs.set(1, pr(1));
+        await f.machine.tick(1_000);
+        await until(() => f.codex.runs.length === 1);
+        assert.equal(f.store.jobs()[0].role, "merge");
+        f.codex.runs[0].finish({
+          outcome: "completed",
+          result: {
+            decision: "done",
+            summary: "Merge the Ready candidate.",
+            issueIds: [task.id],
+          },
+        });
+        await f.machine.drain();
+        // Metadata changes do not invalidate the Linear handoff or planned order.
+        f.linear.issues.get(task.id)!.updatedAt = "2026-11-07T01:00:00Z";
+        f.github.prs.get(1)!.updatedAt = "2026-11-07T01:00:00Z";
+        await f.machine.tick(3_000);
+        assert.deepEqual(f.github.merges, [1]);
+        assert.equal(f.codex.runs.length, 1);
+        assert.deepEqual(f.linear.updates, []);
+      },
+    );
+  }
+});
+
+test("Ready conflicts return to the original Lead with the completed human gate removed", async (t) => {
   const task = issue(1, {
     state: "Ready to merge",
+    labels: ["needs-human", "Feature"],
     prUrls: [pr(1).url],
-    updatedAt: "2026-11-07T01:00:00Z",
   });
   const f = await fixture(t, [task]);
   f.config.repositories[0].auto_merge = true;
-  f.github.prs.set(1, pr(1));
-  f.store.save(
-    savedJob(task, "review", {
-      prNumber: 1,
-      head: "head-1",
-      reviewedHead: "head-1",
-      fingerprint: `head-1:${pr(1).updatedAt}:${task.updatedAt}:context-1`,
-    }),
-  );
-  f.store.set("merge:demo:issue-1", {
-    issueId: task.id,
-    pr: 1,
-    head: "head-1",
-    summary: "Approved earlier requirements.",
-    updatedAt: "2026-11-07T00:00:00Z",
-    prUpdatedAt: pr(1).updatedAt,
-    reviewFingerprint: "context-1",
-  });
-  await f.machine.tick(1_000);
-  await until(() => f.codex.runs.length === 1);
-  f.codex.runs[0].finish({
-    outcome: "completed",
-    result: {
-      decision: "done",
-      summary: "Merge this approved candidate first.",
-      issueIds: [task.id],
+  const previous = savedJob(task, "execution", {
+    threadId: "original-lead",
+    workspace: {
+      path: f.config.repositories[0].path,
+      branch: "symphony/eng-1",
+      baseline: "base",
     },
+    prNumber: 1,
   });
-  await f.machine.drain();
-  await f.machine.tick(3_000);
+  f.store.save(previous);
+  f.github.prs.set(1, pr(1, { mergeable: "CONFLICTING" }));
+  await f.machine.tick(1_000);
+  await f.machine.flush();
+  assert.equal(f.linear.issues.get(task.id)!.state, "Todo");
+  assert.deepEqual(f.linear.issues.get(task.id)!.labels, ["Feature"]);
+  assert.match(f.linear.comments[0].body, /Lead must resolve conflicts/);
   assert.deepEqual(f.github.merges, []);
-  assert.equal(f.store.get("merge:demo:issue-1"), null);
-  await until(() => f.codex.runs.length === 2);
+  await f.machine.tick(3_000);
+  await until(() => f.codex.runs.length === 1);
+  assert.equal(f.codex.runs[0].input.threadId, "original-lead");
 });
 
 test("execution observes unfinished and blocked Linear work without marking it delivered", async (t) => {
@@ -992,7 +1203,8 @@ test("merge planning shares its repository review capacity while other repositor
   await until(() => f.codex.runs.length === 2);
   assert.equal(f.machine.activeCount, 2);
   assert.deepEqual(
-    f.store.jobs()
+    f.store
+      .jobs()
       .filter((job) => job.status === "running")
       .map((job) => ({ repo: job.repo, role: job.role })),
     [
@@ -1037,7 +1249,11 @@ test("a pending merge planner is not duplicated on later polls when spare review
 });
 
 test("independent PR review promotes Direct delivery to the configured ready state without reviewing its own transition again", async (t) => {
-  const task = issue(1, { state: "In Review", labels: ["Symphony mode/Direct"], prUrls: [pr(1).url] });
+  const task = issue(1, {
+    state: "In Review",
+    labels: ["Symphony mode/Direct"],
+    prUrls: [pr(1).url],
+  });
   const f = await fixture(t, [task]);
   f.config.repositories[0].states.ready_to_merge = "Merge queue";
   f.github.prs.set(1, pr(1));
@@ -1046,12 +1262,16 @@ test("independent PR review promotes Direct delivery to the configured ready sta
   assert.match(f.codex.runs[0].input.prompt, /independent Code Reviewer/);
   assert.match(f.codex.runs[0].input.prompt, /First independent PR review/);
   assert.match(f.codex.runs[0].input.prompt, /GitHub PR/);
-  f.codex.runs[0].finish({ outcome: "completed", result: { decision: "ready_to_merge", summary: "PR review and delivery evidence passed.", prNumber: 1 } });
+  f.codex.runs[0].finish({
+    outcome: "completed",
+    result: {
+      decision: "ready_to_merge",
+      summary: "PR review and delivery evidence passed.",
+      prNumber: 1,
+    },
+  });
   await f.machine.drain();
   assert.equal(f.linear.issues.get(task.id)!.state, "Merge queue");
-  const permission = f.store.get<{ updatedAt: string; reviewFingerprint: string }>("merge:demo:issue-1")!;
-  assert.equal(permission.updatedAt, f.linear.issues.get(task.id)!.updatedAt);
-  assert.equal(permission.reviewFingerprint, "context-1");
   assert.equal(f.store.jobs()[0].reviewedHead, "head-1");
   await f.machine.tick(3_000);
   assert.equal(f.codex.runs.length, 1);
@@ -1063,7 +1283,15 @@ test("same-head Lead PR dispositions resume incremental review after findings re
   f.github.prs.set(1, pr(1));
   await f.machine.tick(1_000);
   await until(() => f.codex.runs.length === 1);
-  f.codex.runs[0].finish({ outcome: "completed", result: { decision: "needs_changes", summary: "Resolve findings in https://github.com/demo/repo/pull/1#discussion_r1", prNumber: 1 } });
+  f.codex.runs[0].finish({
+    outcome: "completed",
+    result: {
+      decision: "needs_changes",
+      summary:
+        "Resolve findings in https://github.com/demo/repo/pull/1#discussion_r1",
+      prNumber: 1,
+    },
+  });
   await f.machine.drain();
   assert.equal(f.linear.issues.get(task.id)!.state, "Todo");
   f.github.reviewFingerprints.set(1, "lead-rejected-with-evidence");
@@ -1071,10 +1299,20 @@ test("same-head Lead PR dispositions resume incremental review after findings re
   await f.machine.tick(3_000);
   await until(() => f.codex.runs.length === 2);
   assert.equal(f.codex.runs[1].input.threadId, "thread-1");
-  assert.match(f.codex.runs[1].input.prompt, /Incremental re-review.*Last completed review head: head-1/);
+  assert.match(
+    f.codex.runs[1].input.prompt,
+    /Incremental re-review.*Last completed review head: head-1/,
+  );
   assert.match(f.codex.runs[1].input.prompt, /If the head is unchanged/);
   assert.match(f.codex.runs[1].input.prompt, /reasoned Lead disposition/);
-  f.codex.runs[1].finish({ outcome: "completed", result: { decision: "ready_to_merge", summary: "Lead disposition recorded on PR; required evidence passed.", prNumber: 1 } });
+  f.codex.runs[1].finish({
+    outcome: "completed",
+    result: {
+      decision: "ready_to_merge",
+      summary: "Lead disposition recorded on PR; required evidence passed.",
+      prNumber: 1,
+    },
+  });
   await f.machine.drain();
   assert.equal(f.linear.issues.get(task.id)!.state, "Ready to merge");
 });
@@ -1101,30 +1339,120 @@ test("required human review holds In Review and a reviewer failure does not decl
       f.github.prs.set(1, pr(1));
       await f.machine.tick(1_000);
       await until(() => f.codex.runs.length === 1);
-      f.codex.runs[0].finish(human
-        ? { outcome: "completed", result: { decision: "needs_human", summary: "Lead requires owner review of permission changes; see PR #1.", prNumber: 1 } }
-        : { outcome: "failed", error: "GitHub tool unavailable" });
+      f.codex.runs[0].finish(
+        human
+          ? {
+              outcome: "completed",
+              result: {
+                decision: "needs_human",
+                summary:
+                  "Lead requires owner review of permission changes; see PR #1.",
+                prNumber: 1,
+              },
+            }
+          : { outcome: "failed", error: "GitHub tool unavailable" },
+      );
       await f.machine.drain();
       assert.equal(f.linear.issues.get(task.id)!.state, "In Review");
-      assert.equal(f.linear.issues.get(task.id)!.labels.includes("needs-human"), human);
-      assert.equal(f.store.get("merge:demo:issue-1"), null);
+      assert.equal(
+        f.linear.issues.get(task.id)!.labels.includes("needs-human"),
+        human,
+      );
       await f.machine.tick(3_000);
       assert.equal(f.codex.runs.length, 1);
     });
   }
 });
 
-test("a Ready ticket with a changed head returns to Lead instead of reviewing before delivery evidence is refreshed", async (t) => {
+test("an agent's existing Ready handoff is respected after review completion", async (t) => {
+  const task = issue(1, { state: "In Review", prUrls: [pr(1).url] });
+  const f = await fixture(t, [task]);
+  f.config.repositories[0].auto_merge = true;
+  f.github.prs.set(1, pr(1));
+  await f.machine.tick(1_000);
+  await until(() => f.codex.runs.length === 1);
+  await f.linear.updateIssue(task.id, { state: "Ready to merge" });
+  f.codex.runs[0].finish({
+    outcome: "completed",
+    result: {
+      decision: "ready_to_merge",
+      summary: "Reviewed head-1.",
+      prNumber: 1,
+    },
+  });
+  await f.machine.drain();
+  await f.machine.tick(3_000);
+  await until(() => f.codex.runs.length === 2);
+  assert.equal(f.store.jobs().filter((j) => j.role === "review").length, 1);
+  assert.equal(
+    f.store.jobs().find((j) => j.status === "running")!.role,
+    "merge",
+  );
+  assert.equal(f.linear.issues.get(task.id)!.state, "Ready to merge");
+});
+
+test("a PR head changed during merge planning returns to Lead verification", async (t) => {
   const task = issue(1, { state: "Ready to merge", prUrls: [pr(1).url] });
   const f = await fixture(t, [task]);
-  f.github.prs.set(1, pr(1, { head: "new-head", checks: "pending" }));
-  f.store.save(savedJob(task, "review", { prNumber: 1, head: "head-1", reviewedHead: "head-1" }));
+  f.config.repositories[0].auto_merge = true;
+  f.github.prs.set(1, pr(1));
   await f.machine.tick(1_000);
+  await until(() => f.codex.runs.length === 1);
+  f.github.prs.get(1)!.head = "head-2";
+  f.github.prs.get(1)!.checks = "pending";
+  f.codex.runs[0].finish({
+    outcome: "completed",
+    result: { decision: "done", summary: "Merge first.", issueIds: [task.id] },
+  });
+  await f.machine.drain();
+  await f.machine.tick(3_000);
   await f.machine.flush();
+  assert.deepEqual(f.github.merges, []);
+  assert.equal(f.codex.runs.length, 1);
   assert.equal(f.linear.issues.get(task.id)!.state, "Todo");
+  assert.match(f.linear.comments[0].body, /head changed after merge planning/);
+});
+
+test("resolved external review blockers resume on returning to In Review", async (t) => {
+  const task = issue(1, { state: "In Review", prUrls: [pr(1).url] });
+  const f = await fixture(t, [task]);
+  f.github.prs.set(1, pr(1));
+  await f.machine.tick(1_000);
+  await until(() => f.codex.runs.length === 1);
+  f.codex.runs[0].finish({
+    outcome: "completed",
+    result: {
+      decision: "blocked",
+      summary: "External evidence unavailable.",
+      prNumber: 1,
+    },
+  });
+  await f.machine.drain();
+  assert.equal(f.linear.issues.get(task.id)!.state, "Blocked");
+  await f.linear.comment(
+    task.id,
+    "External prerequisite restored; resume review.",
+  );
+  await f.linear.updateIssue(task.id, { state: "In Review" });
+  await f.machine.tick(3_000);
+  await until(() => f.codex.runs.length === 2);
+  assert.equal(f.codex.runs[1].input.threadId, "thread-1");
+});
+
+test("Ready waits for current CI and honors no-auto-pickup", async (t) => {
+  const task = issue(1, { state: "Ready to merge", prUrls: [pr(1).url] });
+  const f = await fixture(t, [task]);
+  f.config.repositories[0].auto_merge = true;
+  f.github.prs.set(1, pr(1, { checks: "pending" }));
+  await f.machine.tick(1_000);
+  await f.machine.tick(3_000);
   assert.equal(f.codex.runs.length, 0);
-  assert.match(f.linear.comments[0].body, /Lead must verify/);
-  assert.equal(f.store.jobs()[0].reviewedHead, "head-1");
+  assert.deepEqual(f.linear.updates, []);
+  f.github.prs.get(1)!.checks = "success";
+  f.linear.issues.get(task.id)!.labels = ["needs-human", "no-auto-pickup"];
+  await f.machine.tick(5_000);
+  assert.equal(f.codex.runs.length, 0);
+  assert.deepEqual(f.github.merges, []);
 });
 
 test("a no-PR CI incident already completed in Linear is observed locally", async (t) => {
@@ -1172,4 +1500,84 @@ test("reloaded polling and maintenance intervals affect the next scheduling roun
   await f.machine.tick(1001);
   assert.ok(polls > before, "old poll deadline is replaced on reload");
   assert.equal(f.store.get("maintenance_next:demo"), 1000 + 2 * 3600000);
+});
+
+test("repository poll failures back off without dashboard bypass, survive reload, and reset after success", async (t) => {
+  const f = await fixture(t);
+  f.config.polling.linear_seconds = 60;
+  f.config.polling.master_ci_seconds = 60;
+  let attempts = 0;
+  let unavailable = true;
+  let linearReads = 0;
+  const list = f.linear.listIssues.bind(f.linear);
+  f.linear.listIssues = async (filter) => {
+    linearReads++;
+    return list(filter);
+  };
+  f.github.masterHealth = async () => {
+    attempts++;
+    if (unavailable) throw new Error("upstream unavailable");
+    return { sha: "master-sha", status: "success" };
+  };
+  let now = 1_000;
+  for (let failure = 1; failure <= 5; failure++) {
+    await f.machine.tick(now);
+    assert.equal(attempts, failure);
+    assert.equal(
+      linearReads,
+      0,
+      "dashboard must respect the repository cooldown",
+    );
+    const details = f.logs.findLast((log) => log.event === "poll_error")!
+      .details as { failures: number; retryAt: string; retryInMs: number };
+    assert.equal(details.failures, failure);
+    const minimum = Math.min(60_000 * 2 ** failure, 900_000);
+    assert.ok(
+      details.retryInMs >= minimum &&
+        details.retryInMs <= Math.min(minimum * 2, 900_000),
+    );
+    now = Date.parse(details.retryAt);
+    if (failure === 1) f.machine.reload(structuredClone(f.config));
+    await f.machine.tick(now - 1);
+    assert.equal(attempts, failure);
+  }
+  unavailable = false;
+  await f.machine.tick(now);
+  assert.equal(attempts, 6);
+  assert.ok(linearReads > 0);
+  unavailable = true;
+  await f.machine.tick(now + 60_000);
+  const reset = f.logs.findLast((log) => log.event === "poll_error")!
+    .details as { failures: number };
+  assert.equal(reset.failures, 1);
+});
+
+test("failed outbox synchronization backs off instead of writing on every runner tick", async (t) => {
+  const task = issue(1, { labels: ["no-auto-pickup"] });
+  const f = await fixture(t, [task]);
+  f.store.set("outbox", [
+    { id: "change-1", issueId: task.id, state: "Blocked" },
+  ]);
+  let attempts = 0;
+  const update = f.linear.updateIssue.bind(f.linear);
+  f.linear.updateIssue = async (id, patch) => {
+    attempts++;
+    if (attempts <= 2) throw new Error("Linear temporarily unavailable: 502");
+    return update(id, patch);
+  };
+  let now = 1_000;
+  for (let failure = 1; failure <= 2; failure++) {
+    await f.machine.tick(now);
+    const details = f.logs.findLast((log) => log.event === "sync_error")!
+      .details as { failures: number; retryAt: string };
+    assert.equal(details.failures, failure);
+    now = Date.parse(details.retryAt);
+    await f.machine.tick(now - 1);
+    assert.equal(attempts, failure);
+    assert.equal(f.store.get<unknown[]>("outbox")!.length, 1);
+  }
+  await f.machine.tick(now);
+  assert.equal(attempts, 3);
+  assert.deepEqual(f.store.get("outbox"), []);
+  assert.equal(f.linear.issues.get(task.id)!.state, "Blocked");
 });
