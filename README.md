@@ -74,9 +74,9 @@ Doctor checks prerequisites and connections without starting agent work. Leave t
 ## Run your first ticket
 
 1. Create a code-change issue in the configured Linear project, with approved scope and clear acceptance criteria. This version delivers code through PRs; it does not execute non-code-only tickets.
-2. Move it to Todo when you want Symphony to start. Dependencies must be complete; `needs-human` and `no-auto-pickup` prevent automatic pickup.
+2. Move it to Todo when you want Symphony to start. Dependencies must be complete; `no-auto-pickup` prevents automatic pickup in every status. `needs-human` only holds In Review, so returning an issue to Todo resumes implementation even with that label.
 3. Follow progress in Linear, the dashboard, and the linked GitHub PR. The normal path is Todo → In Progress → In Review → Ready to merge → Done. Pickup uses polling, so it may take a few minutes.
-4. Respond to requests marked `needs-human`. For a resolved decision in Blocked, remove the label and return the issue to Todo (or In Review for review-only work). Complete required human review or acceptance by moving the issue to Ready to merge.
+4. Respond to requests marked `needs-human`. For a resolved decision in Blocked, remove the label and return the issue to Todo (or In Review for review-only work). For review changes, leave your findings in the PR and return the issue to Todo; `needs-human` may remain. When the updated work returns to In Review, any still-required human review waits again with that label. Complete required human review or acceptance by moving the issue to Ready to merge.
 
 Eligible PRs merge in scheduled groups after review and required checks. With automatic merging enabled, the default group interval is 30 minutes, with a 5-minute observation window after successful target CI for each merge.
 

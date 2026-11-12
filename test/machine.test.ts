@@ -497,6 +497,51 @@ test("dependencies require Done plus a PR merged into its configured target or e
   assert.equal(await f.machine.dependenciesReady(dependent, repo), true);
 });
 
+test("human review waits again after Todo revisions resume the original Lead with the label retained", async (t) => {
+  const task = issue(1, {
+    state: "Owner review",
+    labels: ["owner-review"],
+    prUrls: [pr(1).url],
+  });
+  const f = await fixture(t, [task]);
+  f.config.linear.needs_human_label = "owner-review";
+  f.config.repositories[0].states.review = "Owner review";
+  f.github.prs.set(1, pr(1));
+  const previous = savedJob(task, "execution", {
+    threadId: "original-lead",
+    workspace: {
+      path: f.config.repositories[0].path,
+      branch: "symphony/eng-1",
+      baseline: "base-sha",
+    },
+  });
+  f.store.save(previous);
+  await f.machine.tick(1_000);
+  assert.equal(f.codex.runs.length, 0);
+
+  const current = f.linear.issues.get(task.id)!;
+  current.state = "Todo";
+  await f.machine.tick(3_000);
+  await until(() => f.codex.runs.length === 1);
+  assert.equal(f.codex.runs[0].input.threadId, previous.threadId);
+  assert.equal(current.state, "In Progress");
+  assert.deepEqual(current.labels, ["owner-review"]);
+
+  current.state = "Owner review";
+  f.codex.runs[0].finish({
+    outcome: "completed",
+    text: "Revisions ready for owner review.",
+  });
+  await f.machine.drain();
+  await f.machine.tick(5_000);
+  assert.equal(f.codex.runs.length, 1);
+  assert.equal(
+    f.store.jobs().find((job) => job.id === previous.id)!.status,
+    "done",
+  );
+  assert.deepEqual(current.labels, ["owner-review"]);
+});
+
 test("no-auto-pickup reserves Todo and interrupted work for the owner until removed", async (t) => {
   const manual = issue(1, { labels: ["no-auto-pickup"] });
   const interrupted = issue(2, {
@@ -1089,10 +1134,10 @@ test("execution observes unfinished and blocked Linear work without marking it d
     { name: "unfinished", state: "In Progress", labels: [], status: "waiting" },
     { name: "blocked", state: "Blocked", labels: [], status: "blocked" },
     {
-      name: "needs human",
+      name: "unfinished with retained human review label",
       state: "In Progress",
       labels: ["needs-human"],
-      status: "blocked",
+      status: "waiting",
     },
   ]) {
     await t.test(scenario.name, async (t) => {

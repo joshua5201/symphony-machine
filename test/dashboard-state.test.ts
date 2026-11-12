@@ -404,7 +404,7 @@ test("kanban shows all Todo and handled tickets with independent Linear and agen
         { state: "In Progress", startedAt: "2026-11-09T08:00:00Z" },
       ],
     }),
-    issue(5, { state: "In Review" }),
+    issue(5, { state: "In Review", labels: ["human-review"] }),
     issue(6, { state: "Delivered" }),
     issue(7, { state: "Canceled" }),
     issue(8, { state: "Blocked" }),
@@ -450,7 +450,8 @@ test("kanban shows all Todo and handled tickets with independent Linear and agen
   assert.equal(byId("ENG-1").column, "todo");
   assert.equal(byId("ENG-1").agentStatus, null);
   assert.equal(byId("ENG-1").resumeCommand, null);
-  assert.equal(byId("ENG-2").needsHumanReview, true);
+  assert.equal(byId("ENG-2").needsHumanReview, false);
+  assert.equal(byId("ENG-5").needsHumanReview, true);
   assert.equal(byId("ENG-3").column, "done");
   assert.equal(byId("ENG-3").completedAt, finishedAt);
   assert.equal(byId("ENG-4").column, "blocked");

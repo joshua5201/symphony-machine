@@ -265,7 +265,9 @@ export class Machine {
         column,
         state,
         needsHumanReview:
-          issue?.labels.includes(this.config.linear.needs_human_label) ?? false,
+          state === r.states.review &&
+          (issue?.labels.includes(this.config.linear.needs_human_label) ??
+            false),
         noAutoPickupLabel: issue?.labels.includes(
           this.config.linear.no_auto_pickup_label,
         )
@@ -396,9 +398,10 @@ export class Machine {
   private dispatchStopped(repo: string) {
     return this.stopping || this.paused(repo);
   }
-  private skipIssue(issue: LinearIssue, ready = false) {
+  private skipIssue(issue: LinearIssue, r: Repo) {
     return (
-      (!ready && issue.labels.includes(this.config.linear.needs_human_label)) ||
+      (issue.state === r.states.review &&
+        issue.labels.includes(this.config.linear.needs_human_label)) ||
       issue.labels.includes(this.config.linear.no_auto_pickup_label)
     );
   }
@@ -657,7 +660,7 @@ export class Machine {
       const recovering =
         old?.status === "waiting" && issue.state === r.states.in_progress;
       if (issue.state !== r.states.todo && !recovering) continue;
-      if (this.skipIssue(issue)) continue;
+      if (this.skipIssue(issue, r)) continue;
       if (old?.status === "failed" && old.fingerprint === issue.updatedAt)
         continue;
       if (old?.workspace && this.store.get(`cleaned:${old.id}`)) continue;
@@ -711,8 +714,7 @@ export class Machine {
             latest.state === r.states.ready_to_merge ||
             latest.state === r.states.done
               ? "done"
-              : latest.state === r.states.blocked ||
-                  latest.labels.includes(c.linear.needs_human_label)
+              : latest.state === r.states.blocked
                 ? "blocked"
                 : latest.state === r.states.in_progress
                   ? "waiting"
@@ -736,7 +738,7 @@ export class Machine {
         r.concurrency.reviews
       )
         break;
-      if (this.skipIssue(issue)) continue;
+      if (this.skipIssue(issue, r)) continue;
       const execution = this.job(r.id, issue.id, "execution");
       const own = issue.prUrls
         .map((u) =>
@@ -823,7 +825,7 @@ export class Machine {
             latestIssue.description !== issue.description ||
             latestIssue.title !== issue.title ||
             latestIssue.state !== r.states.review ||
-            this.skipIssue(latestIssue)
+            this.skipIssue(latestIssue, r)
           ) {
             j.fingerprint = undefined;
             this.store.save(j);
@@ -988,7 +990,7 @@ export class Machine {
     for (const issue of issues) {
       if (
         issue.state !== r.states.ready_to_merge ||
-        this.skipIssue(issue, true) ||
+        this.skipIssue(issue, r) ||
         [...this.active.values()].some((a) => a.job.issueId === issue.id)
       )
         continue;
@@ -1097,7 +1099,7 @@ export class Machine {
           title: `${r.id} · Merge planning`,
           developerInstructions: contract(this.config, r),
           prompt: `${contract(this.config, r)}
-You are the Merge planning agent for group ${group.id}, separate from the programmatic coordinator that executes merges. Linear ${r.states.ready_to_merge} is the authoritative completed-review handoff, including when needs-human remains. This group has fixed membership, even for a single candidate. Decide which candidates should merge and in which order. The coordinator retains this order across individual merges; later Ready PRs wait for a later group. Read related Linear issues and relevant PR changes as needed. Prioritize CI repair, dependencies and product priorities. Assess overlap and concrete integration risks between these changes (interfaces, data/migrations, shared behavior and delivery order as applicable); do not repeat the independent code review or introduce style/extra-scope requirements. If a candidate needs actionable work or has an identified unavailable prerequisite, record a concise finding and PR evidence link on its Linear ticket and return it to ${r.states.todo} or ${r.states.blocked} respectively; human decision blockers also need an explicit escalation and ${this.config.linear.needs_human_label}. Normal pending CI is polled by the coordinator, not a reason to mark Blocked. Do not merge, update/rebase branches, resolve conflicts, or edit code. Conflicts return to Todo for the original Lead. When returning Ready work to Todo, remove the resolved needs-human label so it can resume; retain it only for a new unresolved human question. Do not repeat review based on timestamps or missing local approval records. Return decision done and issueIds in merge order (a subset is permitted), with rationale in summary. Candidates: ${JSON.stringify(group.candidates)}`,
+You are the Merge planning agent for group ${group.id}, separate from the programmatic coordinator that executes merges. Linear ${r.states.ready_to_merge} is the authoritative completed-review handoff, including when needs-human remains. This group has fixed membership, even for a single candidate. Decide which candidates should merge and in which order. The coordinator retains this order across individual merges; later Ready PRs wait for a later group. Read related Linear issues and relevant PR changes as needed. Prioritize CI repair, dependencies and product priorities. Assess overlap and concrete integration risks between these changes (interfaces, data/migrations, shared behavior and delivery order as applicable); do not repeat the independent code review or introduce style/extra-scope requirements. If a candidate needs actionable work or has an identified unavailable prerequisite, record a concise finding and PR evidence link on its Linear ticket and return it to ${r.states.todo} or ${r.states.blocked} respectively; human decision blockers also need an explicit escalation and ${this.config.linear.needs_human_label}. Normal pending CI is polled by the coordinator, not a reason to mark Blocked. Do not merge, update/rebase branches, resolve conflicts, or edit code. Conflicts return to Todo for the original Lead. When returning Ready work to Todo, remove the resolved needs-human label from the completed handoff; retain it only for a new unresolved human question. Do not repeat review based on timestamps or missing local approval records. Return decision done and issueIds in merge order (a subset is permitted), with rationale in summary. Candidates: ${JSON.stringify(group.candidates)}`,
           ...this.config.codex.review,
           signal,
           onThread: (id) => {
@@ -1179,10 +1181,7 @@ You are the Merge planning agent for group ${group.id}, separate from the progra
         consume(id);
         return;
       }
-      if (
-        issue.state !== r.states.ready_to_merge ||
-        this.skipIssue(issue, true)
-      ) {
+      if (issue.state !== r.states.ready_to_merge || this.skipIssue(issue, r)) {
         consume(id);
         continue;
       }

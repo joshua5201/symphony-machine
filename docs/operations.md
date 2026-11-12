@@ -95,7 +95,7 @@ Run `npm start -- doctor --config symphony.yaml` after setup or connection chang
 | A dependency remains waiting       | Check its Linear state and linked PR targets. Historical/superseded PR links can hold it; clarify obsolete links rather than guessing which PR counts.            |
 | Cleanup keeps a worktree           | Check for active agents, dirty files, or local commits not contained in the merged PR. Resolve retained work before expecting cleanup.                            |
 
-For execution/review recovery, use `status` to inspect recorded jobs and sessions, and `retry --issue TEAM-123` to return failed/blocked work to its queue. Retry does not remove control labels. See the [Linear contract](../agents/workflows/LINEAR-CONTRACT.md) for the full handoff rules.
+For execution/review recovery, use `status` to inspect recorded jobs and sessions, and `retry --issue TEAM-123` to return failed/blocked work to its queue. Retry does not remove control labels. `needs-human` holds automatic pickup only in In Review; Todo revisions and interrupted In Progress work can resume with it retained. Returning the updated work to In Review with that label waits for human review again. `no-auto-pickup` holds all statuses. See the [Linear contract](../agents/workflows/LINEAR-CONTRACT.md) for the full handoff rules.
 
 Pause interrupts managed turns and keeps sessions/worktrees for resumption; already-issued external operations may finish settling. Global pause overrides per-repository flags, and resuming globally preserves individually paused repositories. CLI controls apply on the next runner poll; dashboard controls apply immediately.
 

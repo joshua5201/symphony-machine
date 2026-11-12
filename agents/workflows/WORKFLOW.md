@@ -229,7 +229,7 @@ Lead 必須在 PR 記錄需要／不需要人類 code review 的理由，並在 
 
 需要人類 code review／實機驗收時，判定必須指出觸發的條款、本次具體影響、owner 須檢查的程式／實機驗收項目、證據入口與完成條件。只有「涉及 CI/CD／資安／資料／API」等分類名稱不足以成立。需求、操作或預算已核准，不等於已完成人類 code review／實機驗收；已完成的審查只依其適用版本與範圍沿用。缺少判定或判定無上述依據時回 Todo 由原 Lead 補齊，不由 reviewer 臨時發明人類 gate。程式、測試或證據不足交回 Lead 處理。
 
-完成的成果只等這類人類 code review／實機驗收時，保持 In Review 並加 `needs-human`，連到 PR 與具體待看項目。人類完成審查／驗收後，將 issue 移到 Ready to merge 即完成交接，不需另外建立 SQLite permission；此時殘留的 `needs-human` 不阻擋 merge 流程，`no-auto-pickup` 仍優先禁止自動接手。其他狀態的 `needs-human` 仍須等待人類處理。
+完成的成果只等這類人類 code review／實機驗收時，保持 In Review 並加 `needs-human`，連到 PR 與具體待看項目。人類完成審查／驗收後，將 issue 移到 Ready to merge 即完成交接，不需另外建立 SQLite permission；此時殘留的 `needs-human` 不阻擋 merge 流程，`no-auto-pickup` 仍優先禁止自動接手。`needs-human` 僅在 In Review 阻擋自動接手；Todo 與中斷後的 In Progress 即使保留此 label 也可續做，Blocked 則由狀態本身停止接手。人類退回 Todo 要求修改不等於完成必要的人類 review；Lead 修改完成交回 In Review 時，仍適用的人類 gate 須保留 `needs-human`、更新待看項目與版本證據，繼續等待人類審查。`no-auto-pickup` 在所有狀態都禁止自動接手。
 
 任何階段發現需要人類決策、需求變更或尚缺操作／費用授權，一律依 resume 進 Blocked＋`needs-human`，記錄待決問題與恢復條件；review 中發現也適用，不能留在 In Review 等決策。既有明確核准已涵蓋同一決策或操作時，引用其範圍與來源，不重問。In Review 的 human code review 不承擔待決事項，也不能把未完成實作包裝成待人類 review。
 
@@ -272,7 +272,7 @@ Linear 的 Ready to merge 是 review 完成到 merge 流程的權威交接，包
 
 Coordinator 每次依序 merge 一份，下一份 CI pending 時等待，不越過它。合併後等待新 target SHA 的 CI／已納入指定 workflow 的 deployment 成功，再觀察 `merge.cooldown_minutes`（預設 5 分鐘）才處理下一份；最後一份也完成觀察才結束 group。target SHA 改變或健康結果非成功時重算觀察，期限到時重新查證目前 target。兩項時間皆可由 YAML 熱重載；CI 與 PR 檢查頻率仍由 `polling` 設定。觀察窗口保留檢查 production 的時間，不額外引入監控服務。缺失或 pending CI 都不是通過；target CI 失敗依既有 CI repair 流程處理，修復 PR 可使用已規劃的本組位置或獨立規劃的修復 group，不受一般收組排程限制，避免等待中的 group 擋住修復；仍須完成 review、PR checks 與 merge agent 規劃，修復後的 target CI 與觀察窗口完成才續做一般 merge。
 
-遇到 conflict 或必要的 branch update，回 Todo 交原 Lead，說明原因、PR 與受影響範圍，並移除 Ready to merge 已完成的人類交接所殘留的 `needs-human`，讓 Lead 可續做；若有新的待決人類問題，仍依升級流程加上該 label。由 Lead 在原 branch／PR 處理整合，完成受影響修改與必要 CI/CD／smoke 驗證，再回 In Review 增量審查。其他 PR head 更新也須確認受影響部分的新 head 證據，不能沿用不適用的舊證據；CI pending 時不立即啟動完整 review。審查完成後重新交接 Ready to merge；單純 timestamp 改變不使完成的 review 失效。
+遇到 conflict 或必要的 branch update，回 Todo 交原 Lead，說明原因、PR 與受影響範圍，並移除 Ready to merge 已完成的人類交接所殘留的 `needs-human`；若有新的待決人類問題，仍依升級流程加上該 label。由 Lead 在原 branch／PR 處理整合，完成受影響修改與必要 CI/CD／smoke 驗證，再回 In Review 增量審查。其他 PR head 更新也須確認受影響部分的新 head 證據，不能沿用不適用的舊證據；CI pending 時不立即啟動完整 review。審查完成後重新交接 Ready to merge；單純 timestamp 改變不使完成的 review 失效。
 
 退回與完成的狀態交接依 Linear interface contract，通常沿用 branch／PR／workpad，不固定全部重開。Runner 情境由 coordinator 負責 merge／清理，Done 由 Linear–GitHub integration 更新；Execute 不自行處理。手動情境也只能執行已有明確授權的 merge／deploy，不因 In Review、Ready to merge 或 Closed 自動取得外部操作權限。
 
