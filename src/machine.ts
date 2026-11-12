@@ -22,6 +22,24 @@ type Health = {
   status: "pending" | "success" | "failure" | "unknown";
   url?: string;
 };
+type MergeCandidate = {
+  issueId: string;
+  identifier: string;
+  pr: number;
+  head: string;
+};
+type MergeGroup = {
+  id: string;
+  jobId: string;
+  candidates: MergeCandidate[];
+  order?: string[];
+};
+type MergeObservation = {
+  groupId: string;
+  previousSha?: string;
+  healthySha?: string;
+  healthySince?: number;
+};
 type Sync = {
   id: string;
   issueId: string;
@@ -78,8 +96,24 @@ export class Machine {
         JSON.stringify(repositorySettings(this.config))
     )
       throw new Error(
-        "Runtime/repository changes require restart; polling/concurrency/maintenance settings can reload",
+        "Runtime/repository changes require restart; polling/merge/concurrency/maintenance settings can reload",
       );
+    if (
+      c.merge.group_interval_minutes !==
+      this.config.merge.group_interval_minutes
+    ) {
+      for (const r of c.repositories) {
+        const next = this.store.get<number>(`merge_next:${r.id}`);
+        if (next !== undefined)
+          this.store.set(
+            `merge_next:${r.id}`,
+            next +
+              (c.merge.group_interval_minutes -
+                this.config.merge.group_interval_minutes) *
+                60000,
+          );
+      }
+    }
     if (
       c.maintenance.interval_hours !== this.config.maintenance.interval_hours
     ) {
@@ -452,7 +486,7 @@ export class Machine {
           ) {
             interval = this.config.polling.github_seconds;
             await this.cleanup(r);
-            await this.merge(r);
+            await this.merge(r, completedAt());
           }
           if (
             this.due(`${r.id}:review`, this.config.polling.review_seconds, now)
@@ -865,83 +899,127 @@ export class Machine {
       issue: issue.identifier,
     });
   }
-  private async merge(r: Repo) {
+  private async merge(r: Repo, now = Date.now()) {
     if (!r.auto_merge || this.dispatchStopped(r.id)) return;
     const health = this.store.get<Health>(`health:${r.id}`);
     if (!health) return;
-    // Linear Ready is the handoff, including a human's completed review.
-    // SQLite retains the order for recovery, never a second approval gate.
+    const interval = this.config.merge.group_interval_minutes * 60000;
+    const next = this.store.get<number>(`merge_next:${r.id}`) ?? now;
+    const scheduled = now >= next;
+    if (scheduled)
+      this.store.set(
+        `merge_next:${r.id}`,
+        next + (Math.floor((now - next) / interval) + 1) * interval,
+      );
+
+    const key = `merge_group:${r.id}`;
+    const repairKey = `merge_repair_group:${r.id}`;
+    let group = this.store.get<MergeGroup | null>(key);
+    let repairGroup = this.store.get<MergeGroup | null>(repairKey);
+    // Advancing the schedule above skips busy boundaries without a catch-up run.
+    if (this.count("merge", r.id)) return;
+
+    if (health.status === "failure" && !repairGroup) {
+      const repairId = this.store.get<string>(`repair:${r.id}`);
+      if (repairId && group?.order?.includes(repairId)) {
+        await this.processMergeGroup(r, key, group, now, repairId);
+        return;
+      }
+      const repairPlanning =
+        group?.order === undefined &&
+        group?.candidates.some((candidate) => candidate.issueId === repairId);
+      if (repairId && !repairPlanning) {
+        const candidates = await this.mergeCandidates(r, [
+          await this.linear.getIssue(repairId),
+        ]);
+        if (candidates.length)
+          repairGroup = this.createMergeGroup(r, repairKey, candidates);
+      }
+    }
+    // Repair is an exception to admission timing, never to planning/review/checks.
+    if (repairGroup) {
+      await this.processMergeGroup(r, repairKey, repairGroup, now);
+      return;
+    }
+    if (group) {
+      await this.processMergeGroup(r, key, group, now);
+      return;
+    }
+    if (!scheduled) return;
     const ready = await this.linear.listIssues({
       team: r.team,
       project: r.project,
       state: r.states.ready_to_merge,
     });
-    const candidates: {
-      issueId: string;
-      identifier: string;
-      pr: number;
-      head: string;
-    }[] = [];
-    let plan = this.store.get<{
-      signature: string;
-      order: string[];
-      candidates?: typeof candidates;
-    } | null>(`merge_plan:${r.id}`);
-    for (const issue of ready) {
+    const candidates = await this.mergeCandidates(r, ready);
+    if (!candidates.length) return;
+    group = this.createMergeGroup(r, key, candidates);
+    await this.processMergeGroup(r, key, group, now);
+  }
+  private createMergeGroup(r: Repo, key: string, candidates: MergeCandidate[]) {
+    const job = this.create(
+      r,
+      { id: `merge:${r.id}`, identifier: `merge:${r.id}` },
+      "merge",
+    );
+    this.store.save(job);
+    const group: MergeGroup = { id: job.id, jobId: job.id, candidates };
+    this.store.set(key, group);
+    this.log("merge_group_created", {
+      repo: r.id,
+      group: group.id,
+      issues: candidates.map((candidate) => candidate.identifier),
+      repair: key.startsWith("merge_repair_group:"),
+    });
+    return group;
+  }
+  private returnMergeToLead(r: Repo, issue: LinearIssue, comment: string) {
+    this.sync({
+      issueId: issue.id,
+      state: r.states.todo,
+      labels: issue.labels.filter(
+        (label) => label !== this.config.linear.needs_human_label,
+      ),
+      comment,
+    });
+  }
+  private async mergeCandidates(r: Repo, issues: LinearIssue[]) {
+    const candidates: MergeCandidate[] = [];
+    for (const issue of issues) {
       if (
+        issue.state !== r.states.ready_to_merge ||
         this.skipIssue(issue, true) ||
         [...this.active.values()].some((a) => a.job.issueId === issue.id)
       )
         continue;
       const execution = this.job(r.id, issue.id, "execution");
       const linked = issue.prUrls
-        .map((url) =>
-          url.match(
-            new RegExp(
-              `^https://github\\.com/${r.github.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/pull/(\\d+)(?:[/?#]|$)`,
-            ),
-          ),
-        )
+        .map((url) => {
+          const match = url.match(
+            /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)(?:[/?#]|$)/,
+          );
+          return match?.[1].toLowerCase() === r.github.toLowerCase()
+            ? Number(match[2])
+            : undefined;
+        })
         .find(Boolean);
-      const number =
-        execution?.prNumber ?? (linked ? Number(linked[1]) : undefined);
+      const number = execution?.prNumber ?? linked;
       if (!number) continue;
       const pr = await this.githubFactory(r).pr(number);
+      if (pr.base !== r.branch) continue;
       if (pr.state === "MERGED") {
         await this.merged(r, issue, pr);
         continue;
       }
-      if (pr.state !== "OPEN" || pr.base !== r.branch || pr.draft) continue;
-      // Pin the head already handed to planning, even while new CI is pending.
-      // A fresh Ready handoff needs no local review/approval record.
-      const planned = plan?.candidates?.find(
-        (candidate) => candidate.issueId === issue.id,
-      );
-      if (planned && planned.head !== pr.head) {
-        this.sync({
-          issueId: issue.id,
-          state: r.states.todo,
-          labels: issue.labels.filter(
-            (label) => label !== this.config.linear.needs_human_label,
-          ),
-          comment: `PR #${number} head changed after merge planning started. Lead must verify affected changes at ${pr.head} and return to ${r.states.review}.`,
-        });
-        this.store.set(`merge_plan:${r.id}`, null);
-        plan = null;
-        continue;
-      }
+      if (pr.state !== "OPEN" || pr.draft) continue;
       if (pr.mergeable === "CONFLICTING" || pr.checks === "failure") {
-        this.sync({
-          issueId: issue.id,
-          state: r.states.todo,
-          labels: issue.labels.filter(
-            (label) => label !== this.config.linear.needs_human_label,
-          ),
-          comment:
-            pr.mergeable === "CONFLICTING"
-              ? `PR #${number} conflicts with ${r.branch}. Lead must resolve conflicts in the existing branch/PR and verify affected changes before returning to ${r.states.review}.`
-              : `PR #${number} CI failed on ${pr.head}; Lead must inspect and repair the failure in the existing branch/PR.`,
-        });
+        this.returnMergeToLead(
+          r,
+          issue,
+          pr.mergeable === "CONFLICTING"
+            ? `PR #${number} conflicts with ${r.branch}. Lead must resolve conflicts in the existing branch/PR and verify affected changes before returning to ${r.states.review}.`
+            : `PR #${number} CI failed on ${pr.head}; Lead must inspect and repair the failure in the existing branch/PR.`,
+        );
         continue;
       }
       if (pr.mergeable !== "MERGEABLE" || pr.checks !== "success") continue;
@@ -953,49 +1031,73 @@ export class Machine {
         head: pr.head,
       });
     }
-    candidates.sort(
+    return candidates.sort(
       (a, b) =>
         Number(b.issueId === this.store.get(`repair:${r.id}`)) -
           Number(a.issueId === this.store.get(`repair:${r.id}`)) ||
         a.identifier.localeCompare(b.identifier),
     );
-    const signature = JSON.stringify(candidates);
-    if (!candidates.length) {
-      if (!ready.length) this.store.set(`merge_plan:${r.id}`, null);
-      return;
+  }
+  private async observeMerge(r: Repo, now: number) {
+    const key = `merge_observation:${r.id}`;
+    const observation = this.store.get<MergeObservation | null>(key);
+    if (!observation) return true;
+    let health = this.store.get<Health>(`health:${r.id}`)!;
+    // Recheck live facts when the observation window expires, including the last PR.
+    if (
+      observation.healthySince !== undefined &&
+      now >=
+        observation.healthySince + this.config.merge.cooldown_minutes * 60000
+    ) {
+      health = await this.githubFactory(r).masterHealth();
+      this.store.set(`health:${r.id}`, health);
     }
-    if (plan?.signature !== signature) {
-      if (
-        [...this.active.values()].some(
-          (a) => a.job.repo === r.id && a.job.role === "merge",
-        )
-      )
-        return;
+    if (
+      health.status !== "success" ||
+      !health.sha ||
+      health.sha === observation.previousSha
+    ) {
+      delete observation.healthySha;
+      delete observation.healthySince;
+      this.store.set(key, observation);
+      return false;
+    }
+    if (observation.healthySha !== health.sha) {
+      observation.healthySha = health.sha;
+      observation.healthySince = now;
+      this.store.set(key, observation);
+      this.log("merge_cooldown_started", { repo: r.id, sha: health.sha });
+    }
+    if (
+      now <
+      observation.healthySince! + this.config.merge.cooldown_minutes * 60000
+    )
+      return false;
+    this.store.set(key, null);
+    return true;
+  }
+  private async processMergeGroup(
+    r: Repo,
+    key: string,
+    group: MergeGroup,
+    now: number,
+    repairOnly?: string,
+  ) {
+    if (group.order === undefined) {
       if (
         this.count("merge", r.id) + this.count("review", r.id) >=
         r.concurrency.reviews
       )
         return;
-      const pending = this.store
-        .jobs()
-        .findLast(
-          (j) =>
-            j.repo === r.id && j.role === "merge" && j.status === "waiting",
-        );
-      const j =
-        pending ??
-        this.create(
-          r,
-          { id: `merge:${r.id}`, identifier: `merge:${r.id}` },
-          "merge",
-        );
+      const j = this.store.jobs().find((job) => job.id === group.jobId)!;
       this.launch(j, async (signal) => {
         const response = await this.runner.run({
           threadId: j.threadId,
           cwd: r.path,
           title: `${r.id} · Merge planning`,
           developerInstructions: contract(this.config, r),
-          prompt: `${contract(this.config, r)}\nYou are the Merge planning agent, separate from the programmatic coordinator that executes merges. Linear ${r.states.ready_to_merge} is the authoritative completed-review handoff, including when needs-human remains. Decide which ${r.states.ready_to_merge} candidates should merge this round and in which order. Read related Linear issues and relevant PR changes as needed. Prioritize CI repair, dependencies and product priorities. Assess overlap and concrete integration risks between these changes (interfaces, data/migrations, shared behavior and delivery order as applicable); do not repeat the independent code review or introduce style/extra-scope requirements. If a candidate needs actionable work or has an identified unavailable prerequisite, record a concise finding and PR evidence link on its Linear ticket and return it to ${r.states.todo} or ${r.states.blocked} respectively; human decision blockers also need an explicit escalation and ${this.config.linear.needs_human_label}. Normal pending CI is polled by the coordinator, not a reason to mark Blocked. Do not merge, update/rebase branches, resolve conflicts, or edit code. Conflicts return to Todo for the original Lead. When returning Ready work to Todo, remove the resolved needs-human label so it can resume; retain it only for a new unresolved human question. Do not repeat review based on timestamps or missing local approval records. Return decision done and issueIds in merge order (a subset is permitted), with rationale in summary. Candidates: ${JSON.stringify(candidates)}`,
+          prompt: `${contract(this.config, r)}
+You are the Merge planning agent for group ${group.id}, separate from the programmatic coordinator that executes merges. Linear ${r.states.ready_to_merge} is the authoritative completed-review handoff, including when needs-human remains. This group has fixed membership, even for a single candidate. Decide which candidates should merge and in which order. The coordinator retains this order across individual merges; later Ready PRs wait for a later group. Read related Linear issues and relevant PR changes as needed. Prioritize CI repair, dependencies and product priorities. Assess overlap and concrete integration risks between these changes (interfaces, data/migrations, shared behavior and delivery order as applicable); do not repeat the independent code review or introduce style/extra-scope requirements. If a candidate needs actionable work or has an identified unavailable prerequisite, record a concise finding and PR evidence link on its Linear ticket and return it to ${r.states.todo} or ${r.states.blocked} respectively; human decision blockers also need an explicit escalation and ${this.config.linear.needs_human_label}. Normal pending CI is polled by the coordinator, not a reason to mark Blocked. Do not merge, update/rebase branches, resolve conflicts, or edit code. Conflicts return to Todo for the original Lead. When returning Ready work to Todo, remove the resolved needs-human label so it can resume; retain it only for a new unresolved human question. Do not repeat review based on timestamps or missing local approval records. Return decision done and issueIds in merge order (a subset is permitted), with rationale in summary. Candidates: ${JSON.stringify(group.candidates)}`,
           ...this.config.codex.review,
           signal,
           onThread: (id) => {
@@ -1020,86 +1122,126 @@ export class Machine {
         const order = response.result.issueIds ?? [];
         if (
           new Set(order).size !== order.length ||
-          order.some((id) => !candidates.some((x) => x.issueId === id))
+          order.some(
+            (id) =>
+              !group.candidates.some((candidate) => candidate.issueId === id),
+          )
         )
           throw new Error(
             "Merge planner returned unknown or duplicate candidates",
           );
-        this.store.set(`merge_plan:${r.id}`, { signature, order, candidates });
+        group.order = order;
+        this.store.set(key, group);
         j.status = "done";
         j.summary = response.result.summary;
         this.store.save(j);
       });
       return;
     }
-    candidates.sort(
-      (a, b) => plan.order.indexOf(a.issueId) - plan.order.indexOf(b.issueId),
-    );
-    for (const d of candidates) {
-      if (
-        !plan.order.includes(d.issueId) ||
-        [...this.active.values()].some((a) => a.job.issueId === d.issueId)
-      )
-        continue;
-      const repair = d.issueId === this.store.get(`repair:${r.id}`);
-      if (
-        health.status !== "success" &&
-        !(health.status === "failure" && repair)
-      )
-        continue;
-      const issue = await this.linear.getIssue(d.issueId);
-      if (
-        issue.state !== r.states.ready_to_merge ||
-        this.skipIssue(issue, true) ||
-        !(await this.dependenciesReady(issue, r))
-      )
-        continue;
+    const finish = () => {
+      this.store.set(key, null);
+      this.log("merge_group_finished", { repo: r.id, group: group.id });
+    };
+    const ownsObservation = () =>
+      this.store.get<MergeObservation | null>(`merge_observation:${r.id}`)
+        ?.groupId === group.id;
+    if (!group.order.length && !ownsObservation()) {
+      finish();
+      return;
+    }
+    const health = this.store.get<Health>(`health:${r.id}`)!;
+    const repairId = this.store.get<string>(`repair:${r.id}`);
+    const repair =
+      health.status === "failure" && group.order.includes(repairId ?? "");
+    if (!repair && !(await this.observeMerge(r, now))) return;
+    const order = repairOnly
+      ? group.order.filter((id) => id === repairOnly)
+      : group.order;
+    const consume = (id: string) => {
+      group.order = group.order!.filter((candidate) => candidate !== id);
+      this.store.set(key, group);
+    };
+    for (const id of [...order]) {
+      const d = group.candidates.find((candidate) => candidate.issueId === id)!;
+      if ([...this.active.values()].some((a) => a.job.issueId === id)) return;
+      const issue = await this.linear.getIssue(id);
       const git = this.githubFactory(r);
       const pr = await git.pr(d.pr);
-      if (pr.state === "MERGED") {
-        await this.merged(r, issue, pr);
+      if (pr.base !== r.branch || pr.state === "CLOSED" || pr.draft) {
+        consume(id);
         continue;
+      }
+      if (pr.state === "MERGED") {
+        const latest = await git.masterHealth();
+        this.store.set(`health:${r.id}`, latest);
+        await this.merged(r, issue, pr);
+        this.store.set(`merge_observation:${r.id}`, { groupId: group.id });
+        consume(id);
+        return;
       }
       if (
-        pr.state !== "OPEN" ||
-        pr.base !== r.branch ||
-        pr.draft ||
-        pr.head !== d.head
-      )
-        continue;
-      if (pr.mergeable === "CONFLICTING" || pr.checks === "failure") {
-        this.sync({
-          issueId: issue.id,
-          state: r.states.todo,
-          labels: issue.labels.filter(
-            (label) => label !== this.config.linear.needs_human_label,
-          ),
-          comment:
-            pr.mergeable === "CONFLICTING"
-              ? `PR #${d.pr} conflicts with ${r.branch}. Lead must resolve conflicts in the existing branch/PR and verify affected changes before returning to ${r.states.review}.`
-              : `PR #${d.pr} CI failed on ${pr.head}; Lead must inspect and repair the failure in the existing branch/PR.`,
-        });
+        issue.state !== r.states.ready_to_merge ||
+        this.skipIssue(issue, true)
+      ) {
+        consume(id);
         continue;
       }
-      if (pr.mergeable !== "MERGEABLE" || pr.checks !== "success") continue;
-      // Refresh target health immediately before merging; an earlier poll is not authorization.
+      if (pr.head !== d.head) {
+        this.returnMergeToLead(
+          r,
+          issue,
+          `PR #${d.pr} head changed after merge planning started. Lead must verify affected changes at ${pr.head} and return to ${r.states.review}.`,
+        );
+        consume(id);
+        continue;
+      }
+      if (pr.mergeable === "CONFLICTING" || pr.checks === "failure") {
+        this.returnMergeToLead(
+          r,
+          issue,
+          pr.mergeable === "CONFLICTING"
+            ? `PR #${d.pr} conflicts with ${r.branch}. Lead must resolve conflicts in the existing branch/PR and verify affected changes before returning to ${r.states.review}.`
+            : `PR #${d.pr} CI failed on ${pr.head}; Lead must inspect and repair the failure in the existing branch/PR.`,
+        );
+        consume(id);
+        continue;
+      }
+      if (pr.mergeable !== "MERGEABLE" || pr.checks !== "success") return;
+      if (!(await this.dependenciesReady(issue, r))) return;
+      const isRepair = id === repairId;
+      const current = this.store.get<Health>(`health:${r.id}`)!;
+      if (
+        current.status !== "success" &&
+        !(current.status === "failure" && isRepair)
+      )
+        return;
       const latest = await git.masterHealth();
       this.store.set(`health:${r.id}`, latest);
       if (
         latest.status !== "success" &&
-        !(latest.status === "failure" && repair)
+        !(latest.status === "failure" && isRepair)
       )
         return;
-      if (latest.sha !== health.sha) return; // Re-evaluate integration after a moving target.
+      if (latest.sha !== current.sha) return;
       if (this.dispatchStopped(r.id)) return;
       await git.merge(d.pr, d.head);
       const merged = await git.pr(d.pr);
       if (merged.state !== "MERGED")
         throw new Error("Merge command returned without confirmed merge");
       await this.merged(r, issue, merged);
+      this.store.set(`merge_observation:${r.id}`, {
+        groupId: group.id,
+        previousSha: latest.sha,
+      });
+      consume(id);
       this.store.set(`health:${r.id}`, { sha: "", status: "pending" });
       return;
     }
+    if (
+      !group.order.length &&
+      (!ownsObservation() || (await this.observeMerge(r, now)))
+    )
+      finish();
   }
   private async merged(r: Repo, issue: LinearIssue, pr: PrInfo) {
     if (pr.state !== "MERGED" || pr.base !== r.branch)

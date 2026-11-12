@@ -53,6 +53,12 @@ const schema = z.object({
       dashboard_seconds: positive.default(300),
     })
     .prefault({}),
+  merge: z
+    .object({
+      group_interval_minutes: z.number().positive().default(30),
+      cooldown_minutes: z.number().nonnegative().default(5),
+    })
+    .prefault({}),
   maintenance: z
     .object({
       enabled: z.boolean().default(true),

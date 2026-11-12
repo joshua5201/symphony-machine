@@ -76,7 +76,7 @@ The process owns an independent `codex app-server --listen stdio://` child. No d
 - Restart the same command to reconcile and resume interrupted jobs.
 - One runner may use a data directory at a time; a stale process lock is reclaimed on restart.
 
-Polling intervals, concurrency, and maintenance settings reload while running. Invalid edits leave the previous configuration active. Repository/runtime/auth-path changes require restart. Lowering concurrency never kills an active job.
+Polling intervals, merge timing, concurrency, and maintenance settings reload while running. Invalid edits leave the previous configuration active. Repository/runtime/auth-path changes require restart. Lowering concurrency never kills an active job.
 
 Failed repository polls, dashboard snapshots, and outbox synchronization use the [`retry`](https://github.com/tim-kos/node-retry) package for exponential backoff. The first failure waits two to four times the relevant polling interval, with randomized delays doubling on consecutive failures up to 15 minutes (or the configured interval if longer). Success resets the failure sequence; configuration reloads preserve active cooldowns. Deadlines start after the failed request completes and do not block the runner with sleeps. A repository cooldown also gates its dashboard reads. Failed outbox synchronization retains pending changes and gates automatic polling until the next sync attempt. Active agent completion and explicit shutdown synchronization keep their existing behavior.
 
@@ -153,6 +153,8 @@ Use the address returned by Tailscale. Serve is configured separately; Symphony 
 | Todo/dependencies and interrupted executions                    | 120 seconds |
 | Review candidates                                               | 180 seconds |
 | PR/CI/merge/cleanup tracking                                    | 120 seconds |
+| New merge group admission per repository                        | 30 minutes  |
+| Observation after successful target CI/deployment                | 5 minutes   |
 | Target branch CI                                                | 300 seconds |
 | Dashboard Linear snapshot                                      | 300 seconds |
 | Visible dashboard browser refresh                              | 30 seconds |
@@ -162,7 +164,15 @@ Use the address returned by Tailscale. Serve is configured separately; Symphony 
 | Concurrent maintenance scans per repository                     | 1          |
 | Concurrent merge operations per repository                      | 1          |
 
-Configure intervals under `polling` in `symphony.yaml`; existing explicit values override defaults.
+Configure polling intervals under `polling` and merge timing under `merge` in `symphony.yaml`; existing explicit values override defaults:
+
+```yaml
+merge:
+  group_interval_minutes: 30
+  cooldown_minutes: 5
+```
+
+Both merge durations reload while running. The group interval must be positive; the cooldown may be zero. Changing the interval shifts the next admission deadline by the interval difference. Changing the cooldown applies to the current observation window without resetting its start. Admission and cooldown completion are checked at `polling.github_seconds`; target health updates use `polling.master_ci_seconds`.
 
 Configure `concurrency.execution_tickets`, `concurrency.reviews` and `concurrency.maintenance_scans` inside each `repositories` entry. Each repository has its own limits, defaulting to 3/1/1. There is no global concurrency cap: work in one repository does not consume another repository's capacity. Review and merge-planning agents share their repository's review capacity. Repository concurrency changes reload without interrupting active jobs.
 
@@ -209,13 +219,15 @@ Review produces one of:
 
 Normal pending CI stays in progress while Lead waits, polling with code every five minutes for up to 120 minutes per round. Pending alone is not a blocker or completed verification. The coordinator's polling schedule above is unchanged.
 
-The Merge planning agent evaluates order, dependencies, overlapping changes and integration risk using the completed reviews. It does not repeat full code review, edit code, update or rebase branches, resolve conflicts, or merge. SQLite retains a candidate signature and order for recovery; it does not grant merge permission and candidates are not a frozen batch. The pure TypeScript coordinator rechecks live facts and serially merges an eligible PR with an expected-head check; it does not automatically update PR branches. It merges one PR, then waits for healthy target CI before the next merge.
+The Merge planning agent evaluates order, dependencies, overlapping changes and integration risk using the completed reviews. It does not repeat full code review, edit code, update or rebase branches, resolve conflicts, or merge. Each repository admits a fixed group of currently eligible Ready PRs at startup and every `merge.group_interval_minutes` thereafter. Empty admissions start no agent. Every nonempty group, including a single PR, gets one merge-planning result; later PRs wait for the next group. SQLite retains group membership, pinned PR heads, remaining order, schedule and observation progress for recovery; it does not grant merge permission. An active group skips scheduled admissions, with no catch-up after completion. Removing a merged or ineligible member does not trigger replanning. Interrupted or failed planning resumes on the group's saved conversation.
+
+The pure TypeScript coordinator rechecks live facts and serially merges in the selected order with an expected-head check; it does not automatically update PR branches. Pending checks on the next member wait without overtaking it. After each merge, the coordinator waits for successful CI on the new current target SHA, then observes it for `merge.cooldown_minutes` before the next merge. A changed target or unsuccessful health result resets observation. The last PR also completes this window before its group closes. Live target health is rechecked when the window expires. The window leaves time to observe production; it adds no separate production monitoring service. Deployment is covered when it is included in the configured target workflows.
 
 A conflict, required branch update, failed PR CI, or missing verification for a changed head returns Todo to the original Lead with the reason and PR context. Returning implementation work from Ready to merge clears any stale `needs-human` label from the completed human handoff; a new unresolved human decision still requires it. Lead handles integration on the existing branch/PR and verifies the affected changes; pending CI does not trigger an immediate full review. Once evidence is complete, the PR returns to In Review for incremental review, then Ready to merge. The Ready status does not bypass current-head verification, dependencies, CI or GitHub protections. Missing/pending CI never counts as success. The current implementation conservatively requires all reported PR checks to pass, as well as branch-required checks.
 
 ## Target CI failure and cleanup
 
-Target CI is evaluated for the current remote target SHA, using configured workflow names/paths. Without an explicit list, observed runs are considered, but absent evidence is always unknown. A failed target pauses ordinary merges and creates a deduplicated `[CI repair]` Todo ticket. A repair candidate can pass the merge gate only with passing candidate checks and a completed review. After each merge, the next merge waits for healthy target CI. CI repair tickets execute through the bundled skill and Lead-owned delivery process.
+Target CI is evaluated for the current remote target SHA, using configured workflow names/paths. Without an explicit list, observed runs are considered, but absent evidence is always unknown. A failed target pauses ordinary merges and creates a deduplicated `[CI repair]` Todo ticket. A repair candidate can pass the merge gate only with passing candidate checks and a completed review. An eligible repair may use a separately planned repair group outside the normal admission schedule while a normal group waits, or its existing planned position in that group; only the repair candidate may pass a failed-target gate. Its successful target CI and observation window must finish before ordinary merges resume. CI repair tickets execute through the bundled skill and Lead-owned delivery process.
 
 After a confirmed merge into the configured target, the controller removes its owned worktree, local branch, and remote branch. Cleanup does not depend on Linear's Done sync having arrived, and never sets Done itself. If a saved execution has no PR number yet, the runner discovers its branch's PR. It does not wait for target CI to turn green; later CI repairs get a fresh ticket/worktree. Cleanup:
 

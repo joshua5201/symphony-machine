@@ -32,7 +32,7 @@ const option = (name: string, fallback: string) => {
 async function main() {
   if (command === "help" || args.includes("--help")) {
     console.log(
-      `Symphony Machine — personal foreground runner\n\n  npm start -- run --config symphony.yaml\n  npm start -- doctor --config symphony.yaml\n  npm start -- linear-login --config symphony.yaml\n  npm start -- status --config symphony.yaml\n  npm start -- pause|resume --repo all --config symphony.yaml\n  npm start -- retry --issue TEAM-123 --config symphony.yaml\n\nFirst Ctrl+C drains active work. Second Ctrl+C interrupts and saves resumable state.\nPolling, concurrency and maintenance settings reload automatically; other changes need restart.`,
+      `Symphony Machine — personal foreground runner\n\n  npm start -- run --config symphony.yaml\n  npm start -- doctor --config symphony.yaml\n  npm start -- linear-login --config symphony.yaml\n  npm start -- status --config symphony.yaml\n  npm start -- pause|resume --repo all --config symphony.yaml\n  npm start -- retry --issue TEAM-123 --config symphony.yaml\n\nFirst Ctrl+C drains active work. Second Ctrl+C interrupts and saves resumable state.\nPolling, merge timing, concurrency and maintenance settings reload automatically; other changes need restart.`,
     );
     return;
   }

@@ -29,6 +29,10 @@ polling:
   master_ci_seconds: 300
   dashboard_seconds: 300 # Linear snapshot; browser reads local state every 30 seconds.
 
+merge:
+  group_interval_minutes: 30
+  cooldown_minutes: 5
+
 maintenance:
   enabled: true
   interval_hours: 24

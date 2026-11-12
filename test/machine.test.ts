@@ -1381,7 +1381,7 @@ test("an agent's existing Ready handoff is respected after review completion", a
     },
   });
   await f.machine.drain();
-  await f.machine.tick(3_000);
+  await f.machine.tick(1_861_000);
   await until(() => f.codex.runs.length === 2);
   assert.equal(f.store.jobs().filter((j) => j.role === "review").length, 1);
   assert.equal(

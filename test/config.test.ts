@@ -45,6 +45,10 @@ test("worktrees default inside each repository while explicit roots retain confi
     }),
   );
   const config = loadConfig(configPath);
+  assert.deepEqual(config.merge, {
+    group_interval_minutes: 30,
+    cooldown_minutes: 5,
+  });
   const [defaultRepo, relativeRepo, absoluteRepo] = config.repositories;
   assert.equal(defaultRepo.path, join(directory, "projects", "default"));
   assert.equal(
@@ -72,5 +76,13 @@ test("worktrees default inside each repository while explicit roots retain confi
     execution_tickets: 3,
     reviews: 1,
     maintenance_scans: 2,
+  });
+  await writeFile(
+    configPath,
+    `merge:\n  group_interval_minutes: 15\n  cooldown_minutes: 2\nrepositories:\n  - id: app\n    path: .\n    github: demo/app\n    team: Demo\n    project: App\n`,
+  );
+  assert.deepEqual(loadConfig(configPath).merge, {
+    group_interval_minutes: 15,
+    cooldown_minutes: 2,
   });
 });

@@ -264,7 +264,9 @@ Lead 準備 open、non-draft 且以 configured branch 為 target 的 PR，提供
 
 Linear 的 Ready to merge 是 review 完成到 merge 流程的權威交接，包含人類完成必要審查／驗收後直接移入的 issue；不要求另有 SQLite merge-permission 紀錄。Merge agent 只評估候選順序、依賴、修改重疊與整合風險，引用既有 review 結論，不重做完整 code review、不寫程式、不 update branch／rebase／解 conflict，也不 merge。純 TypeScript coordinator 依計畫重新讀取 GitHub／Linear facts，執行 checks、expected-head merge 與清理，不自動更新 PR branch；agent 不取得這些執行責任。Ready to merge 不豁免目前 head 的驗證、CI、依賴或 GitHub protections。
 
-SQLite 保存候選 signature 與順序作為執行／恢復計畫，不授予或取代 Linear 的 merge 交接，也不凍結一批候選。候選或相關 facts 改變時重新規劃；每次只 merge 一份，之後等待當前 target CI 成功，再選下一份。缺失或 pending CI 都不是通過；target CI 失敗依既有 CI repair 流程處理。
+每個 repo 在啟動時及每隔 `merge.group_interval_minutes`（預設 30 分鐘）收集當下符合條件的 Ready PR，建立固定成員的 group；沒有候選不啟動 agent，只有一份也要跑 Merge planning。每組保留一次規劃的順序，個別 PR 合併或退出不重新規劃；新候選等下一組。前一組仍在規劃、執行、等待 CI 或冷卻時，跳過排程且不補跑。SQLite 保存 group、PR head、剩餘順序、排程與觀察進度作為執行／恢復計畫，不授予或取代 Linear 的 merge 交接。中斷或失敗的規劃沿用原 conversation 恢復。
+
+Coordinator 每次依序 merge 一份，下一份 CI pending 時等待，不越過它。合併後等待新 target SHA 的 CI／已納入指定 workflow 的 deployment 成功，再觀察 `merge.cooldown_minutes`（預設 5 分鐘）才處理下一份；最後一份也完成觀察才結束 group。target SHA 改變或健康結果非成功時重算觀察，期限到時重新查證目前 target。兩項時間皆可由 YAML 熱重載；CI 與 PR 檢查頻率仍由 `polling` 設定。觀察窗口保留檢查 production 的時間，不額外引入監控服務。缺失或 pending CI 都不是通過；target CI 失敗依既有 CI repair 流程處理，修復 PR 可使用已規劃的本組位置或獨立規劃的修復 group，不受一般收組排程限制，避免等待中的 group 擋住修復；仍須完成 review、PR checks 與 merge agent 規劃，修復後的 target CI 與觀察窗口完成才續做一般 merge。
 
 遇到 conflict 或必要的 branch update，回 Todo 交原 Lead，說明原因、PR 與受影響範圍，並移除 Ready to merge 已完成的人類交接所殘留的 `needs-human`，讓 Lead 可續做；若有新的待決人類問題，仍依升級流程加上該 label。由 Lead 在原 branch／PR 處理整合，完成受影響修改與必要 CI/CD／smoke 驗證，再回 In Review 增量審查。其他 PR head 更新也須確認受影響部分的新 head 證據，不能沿用不適用的舊證據；CI pending 時不立即啟動完整 review。審查完成後重新交接 Ready to merge；單純 timestamp 改變不使完成的 review 失效。
 
