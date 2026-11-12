@@ -1,6 +1,6 @@
 # Symphony workflow
 
-本檔是 Symphony Machine 維護的正式中文 workflow，定義實際採用的流程、模式與分工。明確呼叫 Symphony skill 或由 runner 派工時啟用。來源與早期決策脈絡見 [Linear](https://linear.app/khinsang-fit/document/78b2171cae13) 與 [DEVPROD-3](https://linear.app/khinsang-fit/issue/DEVPROD-3)；這些保留歷史，不另維護第二份流程。對外的 Linear 狀態與交接語意以 [Linear interface contract](LINEAR-CONTRACT.md) 為準。
+本檔是 Symphony Machine 維護的正式中文 workflow，定義實際採用的流程、模式與分工。明確呼叫 Symphony skill 或由 runner 派工時啟用。對外的 Linear 狀態與交接語意以 [Linear interface contract](LINEAR-CONTRACT.md) 為準。
 
 ## 共通フレーム與分工
 
@@ -21,7 +21,7 @@
 
 對外必須滿足的條件屬於要件；為達成條件而選擇的元件與程式介面設計屬於 plan。人類已指定的技術約束仍是輸入，不因層級而刪除。`design` 是本流程的 UI／Figma ownership 分工；軟體方式設計由 `plan` 負責，詳細設計由 `implement` 負責。
 
-定義參考：[IPA 共通フレーム2013](https://www.ipa.go.jp/publish/secbooks20130304.html)、[第3部ガイダンス §2.4.2–2.4.5](https://www.ipa.go.jp/publish/qv6pgp000000107j-att/000062659.pdf)。上述階段與 agent owner 的對應是本 workflow 的分工。
+定義參考：[IPA 共通フレーム2013](https://www.ipa.go.jp/publish/secbooks20130304.html)、[第3部ガイダンス §2.3.2–2.3.3、§2.4.2–2.4.5](https://www.ipa.go.jp/publish/qv6pgp000000107j-att/000062659.pdf)，分別對應系統要件／方式設計與軟體要件／方式設計／詳細設計／構築。上述階段與 agent owner 的對應是本 workflow 的分工。
 
 ## Principles
 
@@ -43,7 +43,7 @@
 
 人類明確選用 Symphony（例如呼叫 symphony-intake／symphony-execute），或 runner 明確呼叫執行入口時，才啟用本流程；存在本檔或 repo override 不表示自動啟用。
 
-同一次工作使用一套主流程。已選 Symphony 時，不疊加 iterate-app-requirement 或其他完整開發流程；可使用 Figma、平台與工具技能完成專門工作。交給 implementation agent 時明確帶入 `workflow: symphony` 與本檔位置，避免子 agent 自動套回舊 app skill。
+同一次工作使用一套主流程。已選 Symphony 時，不疊加其他完整開發流程；可使用 Figma、平台與工具技能完成專門工作。交給 implementation agent 時明確帶入 `workflow: symphony` 與本檔位置，讓子 agent 沿用同一流程。
 
 互動 session 選用任一 Symphony 入口時，Linear plugin 是必要的 runtime dependency。凡涉及 Linear issue、project、initiative、document、state、comment、workpad、PR 連結或交付狀態的讀寫，必須使用已載入的 Linear plugin 工具；不得開啟 Linear 網頁、使用 browser／computer-use，或直接呼叫 Linear REST／GraphQL API、SDK、CLI、curl 或其他 plugin 以外的 API 路徑。plugin 未載入、未連線或未授權時，停止 Linear 相關工作並回報缺口，不得 fallback。Skill／workflow 只宣告此依賴，不負責安裝、登入或替 session 載入 plugin。
 
@@ -69,7 +69,7 @@ Runner 的 headless session 使用 launcher 指定的官方 Linear MCP 取代 De
 | Lead | gpt-5.6-sol | high |
 | Implementation | gpt-6.1-sol | high |
 
-模型是預設，不是角色限制。由低到高套用：共用預設 → project override → Linear ticket label → 本次 prompt／人類明確指示；只覆蓋指定欄位。Evaluation 指定是有效 override，不需再核准同一選擇。派工時傳入實際解析後的 model／reasoning，不固守 Luna；組合不受工具支援時回報，不默默換回預設。
+模型是預設，不是角色限制。由低到高套用：共用預設 → project override → Linear ticket label → 本次 prompt／人類明確指示；只覆蓋指定欄位。Evaluation 指定是有效 override，不需再核准同一選擇。派工時傳入實際解析後的 model／reasoning；組合不受工具支援時回報，不默默換回預設。
 
 Linear ticket 可用下列互斥 label groups 保存 task override；每組都可省略，只在需要覆蓋繼承值時套用：
 
@@ -211,15 +211,23 @@ Lead 負責必要的本機 checks、CI/CD、已授權 dev／per-PR deployment �
 
 ### 人類 code review 政策
 
-Lead 必須在 PR 記錄需要／不需要人類 code review 的理由，並在 workpad 摘要及連結該判定；需要時明列 owner 必須檢查的範圍、問題與證據入口。缺少這項判定時回 Todo 由原 Lead 補齊，不由 reviewer 臨時發明人類 gate。這是此個人專案明確採用的風險政策，不宣稱是 agent review 可普遍取代人類審查的最佳實務。低風險、保留行為的 refactor、局部修正與文件，可在獨立 agent review 及必要檢查完成後交付，不一律等待人類 code review。以下任一情況仍須人類審查或決定：
+已核准範圍內的工作，預設由 Lead 自查、獨立 Code Reviewer 與必要驗證完成交付；一般功能、bug fix、refactor、文件及 CI/CD 修改均適用。技術與專業判斷由 agent 負責。這是此個人專案明確採用的人類審查政策。
 
-- Ticket、repo 規則或既有人類決定已明確要求 approval／驗收。
-- 實質改變安全、身分驗證／權限、工具權限、sandbox 或 trust boundary。
-- 破壞性或難以還原的資料變更、migration、recovery 風險。
-- 改變 CI/CD、approval gate、merge 或 branch protection。
-- 需要 agent 無法提供的人類專業判斷或實際驗收。
+Lead 必須在 PR 記錄需要／不需要人類 code review 的理由，並在 workpad 摘要及連結該判定。以下正面列表只決定 owner 是否須檢查已完成的實作或做實機驗收：
 
-完成的成果只等這類人類審查／驗收時，保持 In Review 並加 `needs-human`，連到 PR 與具體待看項目。人類完成審查／驗收後，將 issue 移到 Ready to merge 即完成交接，不需另外建立 SQLite permission；此時殘留的 `needs-human` 不阻擋 merge 流程，`no-auto-pickup` 仍優先禁止自動接手。其他狀態的 `needs-human` 仍須等待人類處理。執行中需要人類決策才能繼續則為 Blocked＋`needs-human`；不能把未完成實作包裝成待人類 review。
+- Ticket、repo 規則或既有人類決定已明確要求本次的人類 code review／實機驗收。
+- 刪除、覆寫既有資料，或 schema／migration／recovery 變更會造成不可逆或難以還原的資料影響；可逆的新增欄位、索引等變更不自動觸發。
+- 新增付費服務、訂閱，或會提高支出的計費／預算／用量設定變更；既有核准預算內的正常使用不自動觸發。
+- 新增第三方 API 整合或供應商，或擴大既有整合的 OAuth／存取權限、資料外送範圍或外部操作能力；既有整合在已核准邊界內的一般修正不自動觸發。
+- 新增或擴大存取權、敏感資料暴露範圍，或降低 sandbox／trust boundary 的隔離與保護；維持既定安全契約的修正由 agent 審查。
+- 移除或降低必要檢查、approval gate、merge／branch protection；一般測試參數、cache、建置或已授權部署腳本修改不自動觸發。
+- 必須由人類操作實體設備、且 agent 無法完成的實機驗收；明列設備、操作步驟與驗收標準。
+
+需要人類 code review／實機驗收時，判定必須指出觸發的條款、本次具體影響、owner 須檢查的程式／實機驗收項目、證據入口與完成條件。只有「涉及 CI/CD／資安／資料／API」等分類名稱不足以成立。需求、操作或預算已核准，不等於已完成人類 code review／實機驗收；已完成的審查只依其適用版本與範圍沿用。缺少判定或判定無上述依據時回 Todo 由原 Lead 補齊，不由 reviewer 臨時發明人類 gate。程式、測試或證據不足交回 Lead 處理。
+
+完成的成果只等這類人類 code review／實機驗收時，保持 In Review 並加 `needs-human`，連到 PR 與具體待看項目。人類完成審查／驗收後，將 issue 移到 Ready to merge 即完成交接，不需另外建立 SQLite permission；此時殘留的 `needs-human` 不阻擋 merge 流程，`no-auto-pickup` 仍優先禁止自動接手。其他狀態的 `needs-human` 仍須等待人類處理。
+
+任何階段發現需要人類決策、需求變更或尚缺操作／費用授權，一律依 resume 進 Blocked＋`needs-human`，記錄待決問題與恢復條件；review 中發現也適用，不能留在 In Review 等決策。既有明確核准已涵蓋同一決策或操作時，引用其範圍與來源，不重問。In Review 的 human code review 不承擔待決事項，也不能把未完成實作包裝成待人類 review。
 
 ### 獨立 Code Reviewer
 
