@@ -33,6 +33,9 @@ const server = String.raw`
       result(message, { thread: { id: message.params.threadId || 'thread-' + next++ }, approvalsReviewer: config.reviewer || 'auto_review' });
     } else if (message.method === 'thread/name/set') {
       result(message, {});
+    } else if (message.method === 'thread/unsubscribe') {
+      if (config.unsubscribeError) send({ id: message.id, error: { code: -32603, message: 'Release failed' } });
+      else result(message, { status: 'unsubscribed' });
     } else if (message.method === 'turn/start') {
       const threadId = message.params.threadId;
       const turnId = 'turn-' + threadId;
@@ -106,6 +109,13 @@ test("initializes managed ChatGPT auth, streams separate concurrent threads, and
   });
   assert.equal(ids[0], a.threadId);
   assert.ok(events.some((event) => event.method === "item/agentMessage/delta"));
+  assert.deepEqual(
+    requests()
+      .filter((call) => call.method === "thread/unsubscribe")
+      .map((call) => (call.params as Record<string, unknown>).threadId)
+      .sort(),
+    [a.threadId, b.threadId].sort(),
+  );
   const calls = requests();
   assert.deepEqual(
     calls.slice(0, 3).map((call) => call.method),
@@ -147,6 +157,14 @@ test("initializes managed ChatGPT auth, streams separate concurrent threads, and
   });
   assert.equal(resumed.outcome, "completed");
   assert.equal(resumed.threadId, a.threadId);
+  assert.equal(
+    requests().filter(
+      (call) =>
+        call.method === "thread/unsubscribe" &&
+        (call.params as Record<string, unknown>).threadId === a.threadId,
+    ).length,
+    2,
+  );
   assert.deepEqual(
     (
       requests().find((call) => call.method === "thread/resume")!
@@ -231,6 +249,10 @@ test("cancels approval requests, reports blocked, and leaves another thread runn
   const reply = requests().find((call) => call.id === "approval-1")!;
   assert.deepEqual(reply.result, { decision: "cancel" });
   assert.ok(requests().some((call) => call.method === "turn/interrupt"));
+  assert.equal(
+    requests().filter((call) => call.method === "thread/unsubscribe").length,
+    2,
+  );
 });
 
 test("does not grant permission requests", async (t) => {
@@ -265,6 +287,7 @@ test("AbortSignal and shutdown interrupt active turns", async (t) => {
   abort.abort();
   assert.equal((await first).outcome, "interrupted");
   assert.ok(events.some((event) => event.method === "turn/completed"));
+  assert.equal(requests().at(-1)?.method, "thread/unsubscribe");
   const second = runner.run({ cwd: "/tmp", prompt: "wait again" });
   await until(
     () =>
@@ -290,6 +313,63 @@ test("rejects malformed structured output and preserves a failed turn status", a
   assert.match(badResult.error!, /invalid structured result/);
   assert.equal(badTurn.outcome, "failed");
   assert.equal(badTurn.error, "Inference failed");
+  for (const mock of [invalid, failed])
+    assert.equal(mock.requests().at(-1)?.method, "thread/unsubscribe");
+});
+
+test("releases a thread when cancelled before a turn starts", async (t) => {
+  const { runner, requests } = setup();
+  t.after(() => runner.close());
+  const abort = new AbortController();
+  const result = await runner.run({
+    cwd: "/tmp",
+    prompt: "work",
+    signal: abort.signal,
+    onThread: () => abort.abort(),
+  });
+  assert.equal(result.outcome, "interrupted");
+  assert.equal(requests().at(-1)?.method, "thread/unsubscribe");
+  assert.ok(!requests().some((call) => call.method === "turn/start"));
+});
+
+test("a rejected duplicate run does not release the active thread", async (t) => {
+  const { runner, requests } = setup({ wait: true });
+  t.after(() => runner.close());
+  const abort = new AbortController();
+  const first = runner.run({
+    cwd: "/tmp",
+    prompt: "work",
+    signal: abort.signal,
+  });
+  await until(() => requests().some((call) => call.method === "turn/start"));
+  const duplicate = await runner.run({
+    threadId: "thread-1",
+    cwd: "/tmp",
+    prompt: "duplicate",
+  });
+  assert.equal(duplicate.outcome, "failed");
+  assert.match(duplicate.error!, /already active/);
+  assert.ok(!requests().some((call) => call.method === "thread/unsubscribe"));
+  abort.abort();
+  assert.equal((await first).outcome, "interrupted");
+  assert.equal(requests().at(-1)?.method, "thread/unsubscribe");
+});
+
+test("release failure preserves the completed result and stops further dispatch", async (t) => {
+  const { runner } = setup({ unsubscribeError: true });
+  t.after(() => runner.close());
+  assert.equal(
+    (await runner.run({ cwd: "/tmp", prompt: "work" })).outcome,
+    "completed",
+  );
+  assert.match(
+    runner.failure!,
+    /Could not release Codex thread.*Release failed/,
+  );
+  assert.equal(
+    (await runner.run({ cwd: "/tmp", prompt: "more" })).outcome,
+    "failed",
+  );
 });
 
 test("RPC requests time out and process exit fails active work", async (t) => {
@@ -336,6 +416,7 @@ test("fails explicitly when automatic approval review is unavailable", async (t)
   assert.equal(result.outcome, "failed");
   assert.match(result.error!, /automatic approval review is unavailable/);
   assert.ok(!requests().some((call) => call.method === "turn/start"));
+  assert.equal(requests().at(-1)?.method, "thread/unsubscribe");
 });
 
 async function until(predicate: () => boolean): Promise<void> {

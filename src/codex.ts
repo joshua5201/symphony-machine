@@ -232,6 +232,7 @@ export class CodexRunner {
 
   async run(input: RunInput): Promise<RunResult> {
     let threadId = input.threadId ?? "";
+    let subscribed = false;
     let active: ActiveRun | undefined;
     let abort: (() => void) | undefined;
     try {
@@ -256,19 +257,20 @@ export class CodexRunner {
             : {}),
         }),
       );
-      if (threadResponse.approvalsReviewer !== "auto_review")
-        throw new Error(
-          "Codex automatic approval review is unavailable; cannot run unattended.",
-        );
       const thread = object(threadResponse.thread);
       if (typeof thread.id !== "string")
         throw new Error("Codex did not return a thread ID");
       threadId = thread.id;
+      if (this.active.has(threadId))
+        throw new Error(`A run is already active on thread ${threadId}`);
+      subscribed = true;
+      if (threadResponse.approvalsReviewer !== "auto_review")
+        throw new Error(
+          "Codex automatic approval review is unavailable; cannot run unattended.",
+        );
       input.onThread?.(threadId);
       if (input.signal?.aborted)
         return { threadId, outcome: "interrupted", error: "Run was aborted" };
-      if (this.active.has(threadId))
-        throw new Error(`A run is already active on thread ${threadId}`);
       if (!input.threadId && input.title)
         await this.request("thread/name/set", { threadId, name: input.title });
       if (input.signal?.aborted)
@@ -332,6 +334,21 @@ export class CodexRunner {
       return result;
     } finally {
       if (abort) input.signal?.removeEventListener("abort", abort);
+      // A completed turn remains loaded (and holds its writer lock) until the
+      // connection unsubscribes. Keep the history available for later resume.
+      if (subscribed && !this.closed && !this.fatal) {
+        try {
+          await this.request("thread/unsubscribe", { threadId });
+        } catch (error) {
+          // Preserve the turn's result, but stop dispatching through a server
+          // that failed to release ownership. Normal shutdown releases locks.
+          this.fail(
+            new Error(
+              `Could not release Codex thread ${threadId}: ${errorMessage(error)}`,
+            ),
+          );
+        }
+      }
       if (active && this.active.get(threadId) === active)
         this.active.delete(threadId);
     }

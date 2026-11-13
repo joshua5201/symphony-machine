@@ -195,7 +195,13 @@ export class Machine {
         .flatMap((j) => j.createdIssueIds ?? [])
         .map((id) => identities.get(id) ?? id),
     ]);
-    return [...ids].map((id): DashboardTicket => {
+    const latestTime = (ticket: DashboardTicket) =>
+      Date.parse(
+        (ticket.column === "done" ? ticket.completedAt : null) ??
+          ticket.updatedAt ??
+          "",
+      ) || 0;
+    const tickets = [...ids].map((id): DashboardTicket => {
       const active = [...this.active.values()].find(
         (a) =>
           a.job.repo === r.id &&
@@ -273,10 +279,12 @@ export class Machine {
           : null,
         startedAt:
           active?.startedAt ?? issue?.startedAt ?? previous?.startedAt ?? null,
+        updatedAt: issue?.updatedAt ?? null,
         completedAt: issue?.completedAt ?? null,
         blockedAt,
       };
     });
+    return tickets.sort((a, b) => latestTime(b) - latestTime(a));
   }
   private async pollDashboard(r: Repo) {
     const previous = this.dashboardState.get(r.id);

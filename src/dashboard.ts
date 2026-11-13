@@ -25,6 +25,7 @@ export type DashboardTicket = {
   needsHumanReview: boolean;
   noAutoPickupLabel: string | null;
   startedAt: string | null;
+  updatedAt: string | null;
   completedAt: string | null;
   blockedAt: string | null;
 };

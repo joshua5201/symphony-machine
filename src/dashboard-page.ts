@@ -85,7 +85,7 @@ export const dashboardPage: string = String.raw`<!doctype html>
     .column-title { margin: 0; font-size: 12px; font-weight: 650; }
     .column-count { margin-left: auto; color: var(--muted); font-size: 11px; }
     .column-empty { margin: 0; padding: 12px 0; color: #7a8799; font-size: 11px; text-align: center; }
-    .ticket-list { display: grid; gap: 8px; list-style: none; padding: 0; margin: 0; }
+    .ticket-list { display: grid; grid-auto-rows: max-content; gap: 8px; max-height: 1000px; overflow-y: auto; list-style: none; padding: 0; margin: 0; }
     .ticket { min-width: 0; padding: 11px; border: 1px solid #dfe6ee; border-radius: 7px; background: #fff; }
     .ticket-topline { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 5px; }
     .ticket-link { font-size: 11px; font-weight: 650; text-decoration: none; overflow-wrap: anywhere; }
@@ -147,6 +147,7 @@ export const dashboardPage: string = String.raw`<!doctype html>
       .snapshot { width: 100%; margin-left: 0; }
       .board-scroll { overflow: visible; }
       .kanban { grid-auto-flow: row; grid-auto-columns: auto; grid-template-columns: minmax(0, 1fr); }
+      .ticket-list { max-height: 760px; }
       .round { padding: 14px; }
       .history-summary { flex-wrap: wrap; gap: 8px; padding: 13px; }
       .history-theme { flex-basis: calc(100% - 24px); }
@@ -543,6 +544,8 @@ export const dashboardPage: string = String.raw`<!doctype html>
         const count = element('span', 'column-count');
         heading.append(element('h4', 'column-title', label), count);
         const list = element('ul', 'ticket-list');
+        list.tabIndex = 0;
+        list.setAttribute('aria-label', label + ' 工作');
         const empty = element('p', 'column-empty', '暫無工作');
         root.append(heading, list, empty);
         board.append(root);

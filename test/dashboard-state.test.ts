@@ -482,6 +482,39 @@ test("kanban shows all Todo and handled tickets with independent Linear and agen
   assert.deepEqual(f.machine.dashboard().projects[0].tickets, project.tickets);
 });
 
+test("kanban orders newest tickets first, using completion time for Done", async (t) => {
+  const tasks = [
+    issue(1, { updatedAt: "2026-11-01T00:00:00Z" }),
+    issue(2, { updatedAt: "2026-11-09T00:00:00Z" }),
+    issue(3, {
+      state: "Done",
+      completedAt: "2026-11-07T00:00:00Z",
+      updatedAt: "2026-11-10T00:00:00Z",
+    }),
+    issue(4, {
+      state: "Done",
+      completedAt: "2026-11-08T00:00:00Z",
+      updatedAt: "2026-11-08T00:00:00Z",
+    }),
+    issue(5, { state: "Done", updatedAt: "2026-11-06T00:00:00Z" }),
+  ];
+  const f = await fixture(t, tasks);
+  f.store.set("pause:all", true);
+  for (const task of tasks.slice(2)) f.store.save(savedJob(task, "execution"));
+  await f.machine.tick(1000);
+  const tickets = f.machine.dashboard().projects[0].tickets;
+  const identifiers = (column: string) =>
+    tickets
+      .filter((ticket) => ticket.column === column)
+      .map((ticket) => ticket.identifier);
+  assert.deepEqual(identifiers("todo"), ["ENG-2", "ENG-1"]);
+  assert.deepEqual(identifiers("done"), ["ENG-4", "ENG-3", "ENG-5"]);
+  assert.equal(
+    tickets.find((ticket) => ticket.identifier === "ENG-5")!.completedAt,
+    null,
+  );
+});
+
 test("kanban retains its last Linear snapshot and marks it stale on a read failure", async (t) => {
   const task = issue(1, { state: "Blocked" });
   const f = await fixture(t, [task]);
