@@ -45,7 +45,7 @@
 
 同一次工作使用一套主流程。已選 Symphony 時，不疊加其他完整開發流程；可使用 Figma、平台與工具技能完成專門工作。交給 implementation agent 時明確帶入 `workflow: symphony` 與本檔位置，讓子 agent 沿用同一流程。
 
-互動 session 選用任一 Symphony 入口時，Linear plugin 是必要的 runtime dependency。凡涉及 Linear issue、project、initiative、document、state、comment、workpad、PR 連結或交付狀態的讀寫，必須使用已載入的 Linear plugin 工具；不得開啟 Linear 網頁、使用 browser／computer-use，或直接呼叫 Linear REST／GraphQL API、SDK、CLI、curl 或其他 plugin 以外的 API 路徑。plugin 未載入、未連線或未授權時，停止 Linear 相關工作並回報缺口，不得 fallback。Skill／workflow 只宣告此依賴，不負責安裝、登入或替 session 載入 plugin。
+在 Codex 或 Antigravity 手動選用任一 Symphony 入口時，先確認目前 session 可使用該平台的 Linear plugin。凡涉及 Linear issue、project、initiative、document、state、comment、workpad、PR 連結或交付狀態的讀寫，必須使用已載入的 Linear plugin 工具；不得開啟 Linear 網頁、使用 browser／computer-use，或直接呼叫 Linear REST／GraphQL API、SDK、CLI、curl 或其他 plugin 以外的 API 路徑。plugin 未載入、未連線或未授權時，停止 Linear 相關工作並回報缺口，不得 fallback。Skill／workflow 只宣告此依賴，不負責安裝、登入或替 session 載入 plugin。
 
 Runner 的 headless session 使用 launcher 指定的官方 Linear MCP 取代 Desktop plugin；同樣不得 fallback 到 REST／GraphQL 或 browser。Runner 提供的 Linear state mapping 對應 [Linear interface contract](LINEAR-CONTRACT.md) 的語意，不以本檔中的顯示名稱硬寫狀態。Runner 已指定 ticket worktree／branch／baseline 時，沿用該工作區，不切換或更新共用 root checkout。執行交付到 In Review 後，由獨立 Code Reviewer 正式審查；完成後進 Ready to merge，由 Merge agent 規劃順序，純 TypeScript coordinator 執行 merge 與清理。Lead 依下述政策判定必要的人類審查，既有明確 gate 仍須滿足。
 
@@ -68,8 +68,11 @@ Runner 的 headless session 使用 launcher 指定的官方 Linear MCP 取代 De
 | Intake | gpt-6-astra | medium |
 | Lead | gpt-5.6-sol | high |
 | Implementation | gpt-6.1-sol | high |
+| Code Reviewer（Codex） | gpt-6.1-sol | xhigh |
 
 模型是預設，不是角色限制。由低到高套用：共用預設 → project override → Linear ticket label → 本次 prompt／人類明確指示；只覆蓋指定欄位。Evaluation 指定是有效 override，不需再核准同一選擇。派工時傳入實際解析後的 model／reasoning；組合不受工具支援時回報，不默默換回預設。
+
+手動 Antigravity 使用該平台的角色預設。Intake／Lead 沿用人類選定的 session，Implementation 依使用者的 Gemini 派工設定。Code Reviewer 預設使用 `inherit`，沿用目前 Execute session 的模型與推理深度，以全新 context 審查。若本次明確指定 Reviewer 設定，依該指示派工。Runner 的角色設定依 launcher。
 
 Linear ticket 可用下列互斥 label groups 保存 task override；每組都可省略，只在需要覆蓋繼承值時套用：
 
@@ -193,6 +196,8 @@ Implementation 的 Figma 輸入是唯讀，需要修改時回報 Lead。沒有�
 
 派工模式下，Lead 提供可續做的 handoff：`workflow: symphony`、本檔與 repo override 位置、workspace／branch／baseline、當前 plan 摘要與 workpad 連結、契約版本、負責的 REQ／DES／AC ID 與追溯表、必要契約／Figma 輸入、寫入範圍、驗證與交付條件、未解事項與升級觸發條件，以及適用 checkpoint／執行期限。模型解析依 setup。
 
+手動 delegated Execute 使用平台的派工工具（Codex subagent、Antigravity `swarm`），把可寫範圍限於受派 task 的工作區與檔案。Lead 收回成果後結束已完成的 worker。
+
 Implementation 依已確認的指示與必要 plan，補足尚缺的ソフトウェア詳細設計（元件內部邏輯、資料結構與演算法），完成實作、合理測試及失敗修正，回傳成果、版本、驗證結果與未解事項。重要未決事項回 Lead；Lead 可在 contract 內決定，需人類裁決或外部依賴時進 Blocked。
 
 Implementation 回報必須標明受影響的 REQ／DES／AC ID、實作位置與驗證證據，由 Lead 更新追溯表。發現不可行、矛盾、遺漏或無法驗收時立即回報 Lead，停止依賴該未決選擇的實作；不得自行降低標準、改外部行為或用測試略過掩蓋缺口。Direct 的 Lead 適用相同規則。
@@ -235,7 +240,7 @@ Lead 必須在 PR 記錄需要／不需要人類 code review 的理由，並在 
 
 ### 獨立 Code Reviewer
 
-每份 PR 都必須由未參與本次實作的 Code Reviewer 正式審查，包括 Direct。Runner 以獨立 review turn 接手；手動 Execute 也須安排獨立 reviewer。Reviewer 不改程式、不 merge；修正與證據補齊交回原 Lead，通常沿用 branch／PR／workpad。
+每份 PR 都必須由未參與本次實作的 Code Reviewer 正式審查，包括 Direct。Runner 以獨立 review turn 接手；手動 Execute 由 Lead 依下節派工。Reviewer 不改程式、不 merge；修正與證據補齊交回原 Lead，通常沿用 branch／PR／workpad。
 
 首輪檢查完整 PR diff、已核准要件及直接受影響的既有 context，涵蓋：
 
@@ -247,6 +252,14 @@ Lead 必須在 PR 記錄需要／不需要人類 code review 的理由，並在 
 可閱讀 callers／callees 等既有 code 理解行為與 regression；這是 context，不是擴張 ticket 或全面審查 repo 的授權。阻擋 finding 必須有具體位置、觸發條件、影響及證據，並指出違反的要件、既有契約或本次引入／加劇的缺陷。個人偏好、nit、想像中的未來案例及無需求依據的測試矩陣不得阻擋交付。既有且非本次造成的問題，自主建立對應 project 的 Backlog ticket 給人類 triage；已有相同 ticket 可沿用。簡述問題、影響、證據與來源 issue／PR，不順手擴大本次修正。若確實阻擋本次 contract／必要驗證，說明依賴，需人類決定時進 Blocked。
 
 後續 review 只檢查前輪 findings 的處置、前輪後的新修改與其直接影響。同一 head 上新增的 Lead 回覆也可能需要確認處置，不要求為了回應 finding 製造 code commit。只有 timestamp 改變不構成再審理由。不得把首輪漏看、且後來沒有改動或因新修改而受影響的既有問題，追加成本輪新 blocker。Reviewer 在 PR 留下已審 head、範圍與結論，讓下一輪沿用已完成的審查，不每次重新全面 review。
+
+### 手動 Execute 的審查交接
+
+1. Lead 依 publish 將 PR 交到 In Review，隨即在本次 Execute 啟動獨立 Reviewer 並等待結論。首輪開全新 context，禁止 fork Lead 或 Implementation 對話。Brief 只給 issue／workpad、契約版本、PR URL、target branch、預期 head SHA、本節與適用 repo 規範的位置。
+2. Codex 使用無 fork 的獨立 subagent。Antigravity 可使用獨立 subagent，或能與實作討論隔離的 swarm worker；實作 swarm 的共享 board 含有討論時，另開乾淨的審查 context。Reviewer 使用唯讀 checkout 或直接讀 GitHub diff。對 GitHub 的寫入僅限於本人在 PR 發表審查與回覆。不得修改工作樹、commit、push、merge 或代替人類批准；需更新 Linear 或建立 Backlog issue 時交 Lead 辦理。
+3. Reviewer 親自讀取 Linear 要件與決定、追溯表、GitHub 的實際 target／head、diff、checks 及必要本機／smoke 證據。依上節的首輪或增量範圍審查，在 PR review／comment 留下已審 SHA、範圍、findings 與結論，將連結交回 Lead。若缺少獨立審查能力或無法在 PR 留痕，記錄缺口與恢復點，不能由 Lead 代寫通過。
+4. Lead 核對 PR 結論與當前 head 後更新 Linear。需修正或補證據就回 Todo，由原 Lead 在本次 Execute 接續，開始修正時進 In Progress。補齊驗證後回 In Review，由原 Reviewer 增量複審；原 Reviewer 已不可用時，由全新獨立 Reviewer 從 PR 上次結論接續。head 改變須先驗證新 head，再審受影響部分。通過且無待辦人類 gate 時進 Ready to merge；只待必要人類 code review／實機驗收時留 In Review 加 `needs-human`，列出待看項目。交接完成後結束審查 worker。
+5. 同一 PR 首審後最多自動修正／複審兩輪，以 PR 上已完成的審查計數。兩輪後若仍有未處置的 blocker，Lead 將剩餘問題、雙方證據及可選處置交人類裁決，進 Blocked 加 `needs-human`。涉及要件或授權的分歧立即依 resume 升級。已有證據且符合下節規則的拒絕處置可直接列入審查結論。
 
 ### Finding 處置與交接
 
@@ -262,7 +275,7 @@ Reviewer 確認目前 head 的要件與必要驗證證據完整、blocking findi
 
 Execute 的交付範圍包含工作 branch 的 commit、push、開／更新 PR、必要 CI／review feedback 處理，以及指定 issue 的 state／workpad／成果連結更新，仍依 repo gates 與已有授權執行。不是 merge、deploy 或任意外部發布的概括授權。
 
-Lead 準備 open、non-draft 且以 configured branch 為 target 的 PR，提供結果、契約版本、要件／驗收覆蓋摘要、追溯表及當前 head 的必要本機／CI/CD／smoke 證據，移到 In Review。交付前必須確認範圍內要件無漏項、追溯無斷點，且沒有尚待裁決的 contract 缺口；核准移出的項目保留決定與後續連結。人類 code review 只依 verify 的政策要求，不將所有 ticket 一律設為人工審查。
+Lead 準備 open、non-draft 且以 configured branch 為 target 的 PR，提供結果、契約版本、要件／驗收覆蓋摘要、追溯表及當前 head 的必要本機／CI/CD／smoke 證據，移到 In Review。交付前必須確認範圍內要件無漏項、追溯無斷點，且沒有尚待裁決的 contract 缺口；核准移出的項目保留決定與後續連結。手動 Execute 接著依[手動審查交接](#手動-execute-的審查交接)派工；runner 派工時由 runner 安排 review turn。人類 code review 依 verify 的政策判定。
 
 ### Merge 規劃與執行
 
@@ -278,7 +291,7 @@ Coordinator 每次依序 merge 一份，下一份 CI pending 時等待，不越�
 
 ## resume
 
-需求、人類決定、狀態與續做摘要以 Linear issue／comments／workpad 為主；詳細 code-review findings、回覆與處置以 GitHub PR 為主。次要：人類在 Codex／tmux 給指示；影響需求、決策與交付時把必要結論同步回 Linear，不貼完整聊天或複製詳細 review。
+需求、人類決定、狀態與續做摘要以 Linear issue／comments／workpad 為主；詳細 code-review findings、回覆與處置以 GitHub PR 為主。次要：人類在互動 session／tmux 給指示；影響需求、決策與交付時把必要結論同步回 Linear，不貼完整聊天或複製詳細 review。
 
 ### 要件異常與升級處理（所有 Execute 階段適用）
 
@@ -303,4 +316,4 @@ Coordinator 每次依序 merge 一份，下一份 CI pending 時等待，不越�
 
 這些是續做摘要而非完整思考；契約版本、追溯及已發生的要件變更／待決事項是必要內容，其他依工作適用性記錄。Repo 保存長期架構／介面／操作知識，task plan／memory 不需另外 doc commit。Linear 暫時不可用可保留本機暫存，恢復後同步回原 workpad，避免雙重權威。
 
-恢復時先讀最新 Linear state、workpad 與 PR feedback，再核對工作樹／commit；保留已完成工作，不把舊 plan 覆蓋人類新決定。原 session 不在時也應能從這些資訊接續。手動 session 的 Review 交接不表示有背景監看，仍由人類 trigger 續做，不建立未要求的 polling／排程；runner session 則由 runner 的既有 polling 與恢復機制接手。
+恢復時先讀最新 Linear state、workpad 與 PR feedback，再核對工作樹／commit；保留已完成工作，不把舊 plan 覆蓋人類新決定。原 session 不在時也應能從這些資訊接續。手動 Execute 進 In Review 時，由仍在執行的 Lead 完成上述審查交接。手動 session 中斷、或已因人類 gate／外部阻礙結束後，需要繼續 agent 工作時由人類再次觸發；結束後沒有背景監看。Runner session 由既有 polling 與恢復機制接手。

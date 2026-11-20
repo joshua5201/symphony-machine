@@ -77,7 +77,7 @@ Use the returned address. Tailscale is configured separately; keep personal addr
 
 Each project has a tab. Columns reflect Linear state, separately from agent activity: a finished agent turn does not mean a ticket is Done. Todo shows all current project Todo tickets; other columns show tickets handled by Symphony or recorded as maintenance-created issues. Completion and Blocked timestamps come from Linear; unavailable historical times stay unknown. Maintenance findings and history appear below the board.
 
-The visible browser normally refreshes local state every 30 seconds; Linear snapshots follow `polling.dashboard_seconds`, including while dispatch is paused. A failed snapshot retains the last successful data with a stale indicator. Transient failures back off automatically, so check the displayed timestamp when progress appears delayed.
+The visible browser normally refreshes local state every 30 seconds. The runner fetches Linear snapshots at `polling.dashboard_seconds` for unpaused repositories. During a global or repository pause, the dashboard displays the last successful in-memory snapshot when available. Resuming makes the repository eligible for a refresh on the next runner tick, subject to any active backoff. A failed snapshot retains the last successful data with a stale indicator.
 
 Expand a ticket's session section to copy its `codex resume` command. Copying does not run it or interrupt an agent. Check agent status before taking over: do not drive an active thread from two clients. Plain LAN HTTP may require copying selected text manually instead of using the clipboard button.
 

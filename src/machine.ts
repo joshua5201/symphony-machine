@@ -348,9 +348,11 @@ export class Machine {
       if (this.pauseStates.get(r.id) !== paused) {
         this.pauseStates.set(r.id, paused);
         // Resume on the next poll while retaining external-service backoffs.
-        if (!paused)
+        if (!paused) {
           for (const key of this.next.keys())
             if (key.startsWith(`${r.id}:`)) this.next.delete(key);
+          this.next.delete(`dashboard:${r.id}`);
+        }
       }
     }
     for (const a of this.active.values())
@@ -527,6 +529,7 @@ export class Machine {
       }
       if (
         this.config.dashboard.enabled &&
+        !this.paused(r.id) &&
         this.retryReady(repositoryPoll, now) &&
         this.due(
           `dashboard:${r.id}`,

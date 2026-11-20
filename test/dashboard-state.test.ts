@@ -393,7 +393,7 @@ test("kanban shows all Todo and handled tickets with independent Linear and agen
   const finishedAt = "2026-11-08T12:10:00Z";
   const blockedAt = "2026-11-07T08:00:00Z";
   const tasks = [
-    issue(1),
+    issue(1, { labels: ["no-auto-pickup"] }),
     issue(2, { labels: ["human-review"] }),
     issue(3, { state: "Delivered", completedAt: finishedAt }),
     issue(4, {
@@ -412,7 +412,6 @@ test("kanban shows all Todo and handled tickets with independent Linear and agen
     issue(10, { state: "Merge queue" }),
   ];
   const f = await fixture(t, tasks);
-  f.store.set("pause:all", true);
   f.config.linear.needs_human_label = "human-review";
   f.config.repositories[0].states.done = "Delivered";
   f.config.repositories[0].states.ready_to_merge = "Merge queue";
@@ -484,8 +483,14 @@ test("kanban shows all Todo and handled tickets with independent Linear and agen
 
 test("kanban orders newest tickets first, using completion time for Done", async (t) => {
   const tasks = [
-    issue(1, { updatedAt: "2026-11-01T00:00:00Z" }),
-    issue(2, { updatedAt: "2026-11-09T00:00:00Z" }),
+    issue(1, {
+      updatedAt: "2026-11-01T00:00:00Z",
+      labels: ["no-auto-pickup"],
+    }),
+    issue(2, {
+      updatedAt: "2026-11-09T00:00:00Z",
+      labels: ["no-auto-pickup"],
+    }),
     issue(3, {
       state: "Done",
       completedAt: "2026-11-07T00:00:00Z",
@@ -499,7 +504,6 @@ test("kanban orders newest tickets first, using completion time for Done", async
     issue(5, { state: "Done", updatedAt: "2026-11-06T00:00:00Z" }),
   ];
   const f = await fixture(t, tasks);
-  f.store.set("pause:all", true);
   for (const task of tasks.slice(2)) f.store.save(savedJob(task, "execution"));
   await f.machine.tick(1000);
   const tickets = f.machine.dashboard().projects[0].tickets;
@@ -518,7 +522,6 @@ test("kanban orders newest tickets first, using completion time for Done", async
 test("kanban retains its last Linear snapshot and marks it stale on a read failure", async (t) => {
   const task = issue(1, { state: "Blocked" });
   const f = await fixture(t, [task]);
-  f.store.set("pause:all", true);
   f.store.save(savedJob(task, "execution", { status: "failed" }));
   await f.machine.tick(1000);
   const before = f.machine.dashboard().projects[0];
@@ -535,18 +538,11 @@ test("kanban retains its last Linear snapshot and marks it stale on a read failu
 test("dashboard uses its own slower Linear schedule and backs off the entire snapshot after one failed read", async (t) => {
   const tasks = [issue(1, { state: "Blocked" }), issue(2, { state: "Done" })];
   const f = await fixture(t, tasks);
-  f.store.set("pause:all", true);
   f.config.polling.dashboard_seconds = 10;
   for (const task of tasks) f.store.save(savedJob(task, "execution"));
-  let lists = 0;
   let reads = 0;
   let unavailable = false;
-  const list = f.linear.listIssues.bind(f.linear);
   const get = f.linear.getIssue.bind(f.linear);
-  f.linear.listIssues = async (filter) => {
-    lists++;
-    return list(filter);
-  };
   f.linear.getIssue = async (id) => {
     reads++;
     if (unavailable) throw new Error("Linear temporarily unavailable: 502");
@@ -555,7 +551,7 @@ test("dashboard uses its own slower Linear schedule and backs off the entire sna
   await f.machine.tick(1_000);
   const before = f.machine.dashboard().projects[0];
   await f.machine.tick(3_000);
-  assert.equal(lists, 1, "dispatch interval does not control dashboard reads");
+  assert.equal(reads, 2, "dispatch interval does not control dashboard reads");
   unavailable = true;
   await f.machine.tick(11_000);
   assert.equal(reads, 3, "stop after the first failed historical ticket read");
@@ -566,15 +562,63 @@ test("dashboard uses its own slower Linear schedule and backs off the entire sna
   assert.ok(backoff.retryInMs >= 20_000 && backoff.retryInMs <= 40_000);
   const retryAt = Date.parse(backoff.retryAt);
   await f.machine.tick(retryAt - 1);
-  assert.equal(lists, 2);
+  assert.equal(reads, 3);
   unavailable = false;
   await f.machine.tick(retryAt);
-  assert.equal(lists, 3);
+  assert.equal(reads, 5);
   assert.equal(f.machine.dashboard().projects[0].ticketsStale, false);
   unavailable = true;
   await f.machine.tick(retryAt + 10_000);
+  assert.equal(reads, 6);
   const reset = f.logs.findLast((log) => log.event === "dashboard_poll_backoff")!.details as { failures: number };
   assert.equal(reset.failures, 1, "successful snapshots reset the failure sequence");
+});
+
+test("dashboard retains paused repositories' snapshots and refreshes them on resume", async (t) => {
+  const first = issue(1, { labels: ["no-auto-pickup"] });
+  const second = issue(2, {
+    team: "Other",
+    project: "Second",
+    labels: ["no-auto-pickup"],
+  });
+  const f = await fixture(t, [first, second], [
+    { id: "other", team: "Other", project: "Second" },
+  ]);
+  f.config.polling.dashboard_seconds = 10;
+  const queried = new Set<string | undefined>();
+  const list = f.linear.listIssues.bind(f.linear);
+  f.linear.listIssues = async (filter) => {
+    queried.add(filter.project);
+    return list(filter);
+  };
+  await f.machine.tick(1_000);
+  const titles = () =>
+    f.machine.dashboard().projects.map((project) => project.tickets[0]?.title);
+  assert.deepEqual(titles(), [first.title, second.title]);
+
+  f.machine.setPaused("demo", true);
+  f.linear.issues.get(first.id)!.title = "Updated first ticket";
+  f.linear.issues.get(second.id)!.title = "Updated second ticket";
+  queried.clear();
+  await f.machine.tick(11_000);
+  assert.deepEqual(queried, new Set(["Second"]));
+  assert.deepEqual(titles(), [first.title, "Updated second ticket"]);
+
+  f.machine.setPaused("all", true);
+  f.linear.issues.get(second.id)!.title = "Latest second ticket";
+  queried.clear();
+  await f.machine.tick(21_000);
+  assert.equal(queried.size, 0);
+  assert.deepEqual(titles(), [first.title, "Updated second ticket"]);
+
+  f.machine.setPaused("all", false);
+  await f.machine.tick(21_001);
+  assert.deepEqual(queried, new Set(["Second"]));
+  assert.deepEqual(titles(), [first.title, "Latest second ticket"]);
+
+  f.machine.setPaused("demo", false);
+  await f.machine.tick(21_002);
+  assert.deepEqual(titles(), ["Updated first ticket", "Latest second ticket"]);
 });
 
 test("dashboard listener configuration changes require restart", async (t) => {

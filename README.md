@@ -80,7 +80,7 @@ Doctor checks prerequisites and connections without starting agent work. Leave t
 
 Eligible PRs merge in scheduled groups after review and required checks. With automatic merging enabled, the default group interval is 30 minutes, with a 5-minute observation window after successful target CI for each merge.
 
-For help preparing requirements, start a fresh Codex session with the Linear plugin connected and invoke [`symphony-intake`](agents/skills/symphony-intake/SKILL.md). It helps clarify and record scope before execution; placing an approved issue directly in Todo also works.
+For manual work in Codex or Antigravity, connect the Linear plugin and invoke [`symphony-intake`](agents/skills/symphony-intake/SKILL.md) to prepare requirements or [`symphony-execute`](agents/skills/symphony-execute/SKILL.md) to deliver an approved ticket. Manual Execute coordinates independent PR review in the same session. Both skills can run without starting the runner.
 
 ## Everyday controls
 
