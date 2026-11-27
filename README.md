@@ -39,7 +39,7 @@ Edit the gitignored `symphony.yaml`, using the [annotated example](symphony.exam
 
 - Set `repositories[].path`, `github`, `branch` (`main` or `master`), and `remote` to match your local checkout and GitHub repository.
 - Set `team` and `project` to the Linear team/project IDs. Each project maps to one repository.
-- Map `states` to your team's existing states, including `Ready to merge`, and create the `needs-human` and `no-auto-pickup` labels if missing. See the [Linear interface contract](agents/workflows/LINEAR-CONTRACT.md#statuses) for their meanings.
+- Map `states` to your team's existing states, including `Ready to merge`, and create the `needs-human`, `no-auto-pickup`, and `new-session` labels if missing. See the [Linear interface contract](agents/workflows/LINEAR-CONTRACT.md#statuses) for their meanings.
 - Set `required_workflows` to your target-branch CI workflow names or file paths.
 - Configure the Linear–GitHub integration to move linked issues to Done after merge. Symphony does not set Done itself.
 
@@ -90,11 +90,15 @@ Run these commands from this checkout in another terminal:
 npm start -- status --config symphony.yaml
 npm start -- pause --repo all --config symphony.yaml
 npm start -- resume --repo all --config symphony.yaml
+npm start -- pause --maintenance --config symphony.yaml
+npm start -- resume --maintenance --config symphony.yaml
 npm start -- retry --issue TEAM-123 --config symphony.yaml
 ```
 
 - Replace `all` with a configured repository `id` to pause/resume one repository. Pause interrupts managed agent turns and preserves their sessions/worktrees; resume continues eligible work. Pause survives restart.
-- Retry returns failed/blocked work to the appropriate queue. It does not remove control labels or resolve human decisions.
+- Use the dashboard's maintenance control or `--maintenance` to pause scans across all repositories while ticket execution, review, and merge continue. Tickets already created by a scan follow the usual workflow.
+- After resolving a ticket failure, return it to Todo or, for review-only work, In Review. The runner resumes the saved session. Add `new-session` before requeuing to start a fresh session using the same worktree and PR. You can also requeue a recorded failed job with `retry --issue`.
+- If the dashboard shows a shared authentication failure, sign in to the affected service and resume that scope. See [troubleshooting and recovery](docs/operations.md#troubleshooting-and-recovery).
 - Add `no-auto-pickup` in Linear to handle a ticket yourself. It prevents further automated work, including merging; already active agents finish.
 - First `Ctrl+C` stops new work and drains active jobs. A second interrupts active turns and saves resumable state. Restart the same `run` command to recover.
 

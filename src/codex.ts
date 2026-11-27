@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
+import { SharedAuthError } from "./recovery.js";
 
 export interface AgentResult {
   decision:
@@ -36,6 +37,7 @@ export interface RunResult {
   result?: AgentResult;
   text?: string;
   error?: string;
+  failure?: "auth" | "transient" | "missing-thread";
 }
 
 const decisions = [
@@ -68,6 +70,36 @@ function object(value: unknown): ObjectValue {
 }
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function classifyFailure(
+  message: string,
+  info?: unknown,
+  resuming = false,
+): RunResult["failure"] {
+  const details = object(info);
+  const status = Object.values(details).map(
+    (detail) => object(detail).httpStatusCode,
+  );
+  if (
+    info === "unauthorized" ||
+    status.includes(401) ||
+    /\b(HTTP 401|failed to refresh your access token|refresh token (?:was|has been|is) (?:revoked|expired|already used)|ChatGPT sign-in is required)\b/i.test(
+      message,
+    )
+  )
+    return "auth";
+  if (
+    resuming &&
+    /no rollout found|thread not found|thread\s+\S+\s+not found/i.test(message)
+  )
+    return "missing-thread";
+  if (
+    info === "serverOverloaded" ||
+    status.some((code) => code === 502 || code === 503 || code === 504) ||
+    ("responseStreamDisconnected" in details && status.includes(null))
+  )
+    return "transient";
 }
 
 function parseResult(text: string): AgentResult {
@@ -178,6 +210,28 @@ export class CodexRunner {
     return servers;
   }
 
+  /** Reload credentials through Codex's normal startup after the current turns drain. */
+  async reloadAuthentication(): Promise<void> {
+    await this.close();
+    this.resetConnection();
+    try {
+      await this.start();
+    } catch (error) {
+      await this.close();
+      this.resetConnection();
+      throw error;
+    }
+  }
+
+  private resetConnection() {
+    this.child = undefined;
+    this.exited = undefined;
+    this.starting = undefined;
+    this.closing = undefined;
+    this.fatal = undefined;
+    this.closed = false;
+  }
+
   private async initialize(): Promise<void> {
     // Let Codex own its existing OAuth credentials and MCP configuration.
     // Never read auth.json or supply copied tokens to the child process.
@@ -188,11 +242,14 @@ export class CodexRunner {
     this.exited = new Promise((resolve) =>
       child.once("close", () => resolve()),
     );
-    child.on("error", (error) => this.fail(error));
+    const fail = (error: Error) => {
+      if (this.child === child) this.fail(error);
+    };
+    child.on("error", fail);
     child.on("close", (code, signal) =>
-      this.fail(new Error(`Codex app-server exited (${signal ?? code})`)),
+      fail(new Error(`Codex app-server exited (${signal ?? code})`)),
     );
-    child.stdin.on("error", (error) => this.fail(error));
+    child.stdin.on("error", fail);
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (text) => this.emit({ type: "stderr", text }));
     const lines = createInterface({ input: child.stdout });
@@ -220,9 +277,7 @@ export class CodexRunner {
         await this.request("account/read", { refreshToken: false }),
       );
       if (object(account.account).type !== "chatgpt") {
-        throw new Error(
-          "ChatGPT sign-in is required. Run codex login in your terminal first.",
-        );
+        throw new SharedAuthError("Codex");
       }
     } catch (error) {
       this.fail(error instanceof Error ? error : new Error(String(error)));
@@ -233,6 +288,7 @@ export class CodexRunner {
   async run(input: RunInput): Promise<RunResult> {
     let threadId = input.threadId ?? "";
     let subscribed = false;
+    let resuming = false;
     let active: ActiveRun | undefined;
     let abort: (() => void) | undefined;
     try {
@@ -241,6 +297,7 @@ export class CodexRunner {
       await this.start();
       if (input.threadId && this.active.has(input.threadId))
         throw new Error(`A run is already active on thread ${input.threadId}`);
+      resuming = Boolean(input.threadId);
       const threadResponse = object(
         await this.request(input.threadId ? "thread/resume" : "thread/start", {
           ...(input.threadId
@@ -257,6 +314,7 @@ export class CodexRunner {
             : {}),
         }),
       );
+      resuming = false;
       const thread = object(threadResponse.thread);
       if (typeof thread.id !== "string")
         throw new Error("Codex did not return a thread ID");
@@ -325,10 +383,15 @@ export class CodexRunner {
       else if (turn.status !== "inProgress") this.complete(current, turn);
       return await completion;
     } catch (error) {
+      const message = active?.stop?.error ?? errorMessage(error);
       const result: RunResult = {
         threadId,
         outcome: active?.stop?.outcome ?? "failed",
-        error: active?.stop?.error ?? errorMessage(error),
+        error: message,
+        failure:
+          error instanceof SharedAuthError
+            ? "auth"
+            : classifyFailure(message, undefined, resuming),
       };
       if (active) this.finish(active, result);
       return result;
@@ -497,12 +560,15 @@ export class CodexRunner {
       return;
     }
     if (turn.status !== "completed") {
+      const error = object(turn.error);
+      const message = String(
+        error.message ?? `Codex turn ${String(turn.status)}`,
+      );
       this.finish(run, {
         threadId: run.threadId,
         outcome: turn.status === "interrupted" ? "interrupted" : "failed",
-        error: String(
-          object(turn.error).message ?? `Codex turn ${String(turn.status)}`,
-        ),
+        error: message,
+        failure: classifyFailure(message, error.codexErrorInfo),
       });
       return;
     }

@@ -8,6 +8,8 @@ test("dashboard serves anonymous views and closes its listener", async () => {
     updatedAt: "2026-11-09T00:00:00Z",
     paused: false,
     activeAgents: 0,
+    maintenancePaused: false,
+    activeMaintenanceAgents: 0,
     stopping: false,
     projects: [],
   };
@@ -82,6 +84,8 @@ test("dashboard controls validate requests and return the updated runner snapsho
     updatedAt: "2026-11-11T00:00:00Z",
     paused: false,
     activeAgents: 1,
+    maintenancePaused: false,
+    activeMaintenanceAgents: 0,
     stopping: false,
     projects: [
       {
@@ -98,13 +102,15 @@ test("dashboard controls validate requests and return the updated runner snapsho
       },
     ],
   };
-  const changes: { repo: string; paused: boolean }[] = [];
+  const changes: { repo: string; paused: boolean; maintenanceOnly: boolean }[] =
+    [];
   const dashboard = await startDashboard(
     { enabled: true, host: "127.0.0.1", port: 0 },
     () => snapshot,
-    (repo, paused) => {
-      changes.push({ repo, paused });
-      if (repo === "all") snapshot.paused = paused;
+    (repo, paused, maintenanceOnly) => {
+      changes.push({ repo, paused, maintenanceOnly });
+      if (maintenanceOnly) snapshot.maintenancePaused = paused;
+      else if (repo === "all") snapshot.paused = paused;
       else snapshot.projects[0].paused = paused;
       snapshot.projects[0].effectivePaused =
         snapshot.paused || snapshot.projects[0].paused;
@@ -115,16 +121,24 @@ test("dashboard controls validate requests and return the updated runner snapsho
     "Content-Type": "application/json",
     "X-Symphony-Control": "1",
   };
-  for (const repo of ["demo", "all"]) {
+  for (const [repo, maintenanceOnly] of [
+    ["demo", false],
+    ["all", false],
+    ["all", true],
+  ] as const) {
     for (const paused of [true, false]) {
       const response = await fetch(`${dashboard.url}/api/control`, {
         method: "POST",
         headers,
-        body: JSON.stringify({ repo, paused }),
+        body: JSON.stringify(
+          maintenanceOnly
+            ? { repo, paused, maintenanceOnly }
+            : { repo, paused },
+        ),
       });
       assert.equal(response.status, 200);
       assert.deepEqual(await response.json(), snapshot);
-      assert.deepEqual(changes.at(-1), { repo, paused });
+      assert.deepEqual(changes.at(-1), { repo, paused, maintenanceOnly });
     }
   }
   for (const body of [
@@ -134,6 +148,8 @@ test("dashboard controls validate requests and return the updated runner snapsho
     '{"repo":"demo"}',
     '{"repo":"demo","paused":"true"}',
     '{"repo":"unknown","paused":true}',
+    '{"repo":"all","paused":true,"maintenanceOnly":"true"}',
+    '{"repo":"demo","paused":true,"maintenanceOnly":true}',
   ]) {
     const response = await fetch(`${dashboard.url}/api/control`, {
       method: "POST",
@@ -179,7 +195,7 @@ test("dashboard controls validate requests and return the updated runner snapsho
   await stopping.text();
   assert.equal(
     changes.length,
-    4,
+    6,
     "rejected requests never change runner state",
   );
 });

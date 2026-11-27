@@ -317,3 +317,5 @@ Coordinator 每次依序 merge 一份，下一份 CI pending 時等待，不越�
 這些是續做摘要而非完整思考；契約版本、追溯及已發生的要件變更／待決事項是必要內容，其他依工作適用性記錄。Repo 保存長期架構／介面／操作知識，task plan／memory 不需另外 doc commit。Linear 暫時不可用可保留本機暫存，恢復後同步回原 workpad，避免雙重權威。
 
 恢復時先讀最新 Linear state、workpad 與 PR feedback，再核對工作樹／commit；保留已完成工作，不把舊 plan 覆蓋人類新決定。原 session 不在時也應能從這些資訊接續。手動 Execute 進 In Review 時，由仍在執行的 Lead 完成上述審查交接。手動 session 中斷、或已因人類 gate／外部阻礙結束後，需要繼續 agent 工作時由人類再次觸發；結束後沒有背景監看。Runner session 由既有 polling 與恢復機制接手。
+
+Runner 遇到可辨識的暫時性 Codex 錯誤時，等該階段的一個輪詢間隔後用同一 session 重試一次。單票執行或審查失敗需要介入時，runner 依 Linear contract 交接到 Blocked。共用登入失效時，runner 暫停受影響範圍的派工並保留 Linear 狀態；登入後用 Resume 接回。原 session 無法載入時，在交接中提示 `new-session`，由人類指定換 thread。

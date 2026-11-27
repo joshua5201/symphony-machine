@@ -12,6 +12,7 @@ import {
 import { type GitHub, type PrInfo } from "../src/github.js";
 import { type LinearClient, type LinearIssue } from "../src/linear.js";
 import { Machine } from "../src/machine.js";
+import { SharedAuthError } from "../src/recovery.js";
 import { Store, type Job } from "../src/store.js";
 import { maintenanceDirections } from "../src/maintenance.js";
 
@@ -71,7 +72,15 @@ function savedJob(
 class FakeLinear {
   issues = new Map<string, ScopedIssue>();
   comments: { id: string; body: string }[] = [];
-  updates: { id: string; patch: { state?: string; labels?: string[] } }[] = [];
+  updates: {
+    id: string;
+    patch: {
+      state?: string;
+      labels?: string[];
+      addLabels?: string[];
+      removeLabels?: string[];
+    };
+  }[] = [];
 
   async listIssues(filter: {
     team?: string;
@@ -94,13 +103,24 @@ class FakeLinear {
   }
   async updateIssue(
     id: string,
-    patch: { state?: string; labels?: string[] },
+    patch: {
+      state?: string;
+      labels?: string[];
+      addLabels?: string[];
+      removeLabels?: string[];
+    },
   ): Promise<void> {
     this.updates.push({ id, patch: structuredClone(patch) });
     const value = this.issues.get(id);
     assert.ok(value);
     if (patch.state) value.state = patch.state;
     if (patch.labels) value.labels = patch.labels;
+    if (patch.addLabels)
+      value.labels = [...new Set([...value.labels, ...patch.addLabels])];
+    if (patch.removeLabels)
+      value.labels = value.labels.filter(
+        (label) => !patch.removeLabels!.includes(label),
+      );
     value.updatedAt = new Date(
       Date.parse(value.updatedAt) + 1000,
     ).toISOString();
@@ -111,6 +131,7 @@ class FakeLinear {
 }
 
 class FakeCodex {
+  async reloadAuthentication() {}
   constructor(private readonly onRun: (input: RunInput) => void = () => {}) {}
   runs: {
     input: RunInput;
@@ -397,6 +418,51 @@ test("interrupted maintenance resumes the same direction, commit range and threa
   });
   await f.machine.drain();
   assert.equal(f.store.jobs().at(-1)!.maintenance!.to, "master-sha");
+});
+
+test("maintenance-only pause preserves the scan across restart while tickets continue", async (t) => {
+  const f = await fixture(t, [issue(1)]);
+  f.config.maintenance.enabled = true;
+  await f.machine.tick(1_000);
+  await until(() => f.codex.runs.length === 2);
+  const scan = f.store.jobs().find((j) => j.role === "maintenance")!;
+  const execution = f.codex.runs.find(
+    (run) => run.input.title === "ENG-1 · Lead",
+  )!;
+
+  f.machine.setPaused("all", true, true);
+  await until(() => f.machine.activeCount === 1);
+  assert.equal(execution.input.signal?.aborted, false);
+  assert.equal(f.store.jobs().find((j) => j.id === scan.id)!.status, "waiting");
+  const paused = f.machine.dashboard();
+  assert.equal(paused.paused, false);
+  assert.equal(paused.maintenancePaused, true);
+  assert.equal(paused.activeMaintenanceAgents, 0);
+
+  const queued = issue(2, { title: "[Maintenance] Approved ticket" });
+  f.linear.issues.set(queued.id, queued);
+  await f.machine.tick(2_000);
+  await until(() => f.codex.runs.length === 3);
+  assert.equal(f.codex.runs[2].input.title, "ENG-2 · Lead");
+
+  f.machine.setPaused("all", true);
+  await f.machine.drain();
+  f.restart();
+  f.machine.setPaused("all", false);
+  await f.machine.tick(2_001);
+  await until(() => f.codex.runs.length === 5);
+  assert.equal(f.machine.dashboard().maintenancePaused, true);
+  assert.equal(f.store.jobs().find((j) => j.id === scan.id)!.status, "waiting");
+
+  f.store.setPaused("all", false, true);
+  f.github.target = "advanced-during-pause";
+  await f.machine.tick(2_002);
+  await until(() => f.codex.runs.length === 6);
+  const resumed = f.store.jobs().filter((j) => j.role === "maintenance");
+  assert.equal(resumed.length, 1);
+  assert.equal(resumed[0].id, scan.id);
+  assert.deepEqual(resumed[0].maintenance, scan.maintenance);
+  assert.equal(f.codex.runs[5].input.threadId, scan.threadId);
 });
 
 test("maintenance capacity and idle checks apply independently to each repository", async (t) => {
@@ -1126,21 +1192,139 @@ test("execution observes unfinished and blocked Linear work without marking it d
   }
 });
 
-test("an execution runner failure is recorded locally while Lead-owned Linear work is preserved", async (t) => {
+test("execution failure moves the ticket to Blocked and Todo resumes the same thread and worktree", async (t) => {
   const task = issue(1);
   const f = await fixture(t, [task]);
   await f.machine.tick(1_000);
   await until(() => f.codex.runs.length === 1);
+  const original = f.store.jobs()[0];
   f.codex.runs[0].finish({
     outcome: "failed",
     error: "Inference failed before a delivery report.",
   });
   await f.machine.drain();
-  assert.equal(f.store.jobs()[0].status, "failed");
+  assert.equal(f.store.jobs()[0].status, "blocked");
   assert.match(f.store.jobs()[0].summary!, /Inference failed/);
+  assert.equal(f.linear.issues.get(task.id)!.state, "Blocked");
+  assert.match(f.linear.comments[0].body, /Execution stopped.*Todo/);
+  await f.machine.tick(3_000);
+  assert.equal(f.codex.runs.length, 1);
+  await f.linear.updateIssue(task.id, { state: "Todo" });
+  await f.machine.tick(5_000);
+  await until(() => f.codex.runs.length === 2);
+  assert.equal(f.codex.runs[1].input.threadId, original.threadId);
+  assert.deepEqual(f.store.jobs()[0].workspace, original.workspace);
+  assert.equal(f.github.prepares.length, 1);
+});
+
+test("new-session is consumed once after saving a fresh thread and preserves the worktree and PR", async (t) => {
+  const task = issue(1, {
+    state: "Blocked",
+    labels: ["bug", "new-session", "needs-human"],
+  });
+  const f = await fixture(t, [task]);
+  const workspace = await f.github.prepare(task.identifier);
+  f.github.prs.set(1, pr(1));
+  f.store.save(
+    savedJob(task, "execution", {
+      status: "blocked",
+      threadId: "old-lead",
+      workspace,
+      prNumber: 1,
+    }),
+  );
+  await f.machine.tick(1_000);
+  await f.linear.updateIssue(task.id, { state: "Todo" });
+  await f.machine.tick(3_000);
+  assert.equal(f.codex.runs.length, 0);
+  await f.linear.updateIssue(task.id, { removeLabels: ["needs-human"] });
+  await f.machine.tick(5_000);
+  await until(() => f.codex.runs.length === 1);
+  assert.equal(f.codex.runs[0].input.threadId, undefined);
+  const fresh = f.store.jobs()[0];
+  assert.notEqual(fresh.threadId, "old-lead");
+  await f.machine.tick(6_000);
+  assert.deepEqual(f.linear.issues.get(task.id)!.labels, ["bug"]);
+  f.codex.runs[0].finish({ outcome: "interrupted" });
+  await f.machine.drain();
+  f.restart();
+  await f.machine.tick(7_000);
+  await until(() => f.codex.runs.length === 2);
+  assert.equal(f.codex.runs[1].input.threadId, fresh.threadId);
+  assert.deepEqual(f.store.jobs()[0].workspace, workspace);
+  assert.equal(f.store.jobs()[0].prNumber, 1);
+  assert.equal(f.github.prepares.length, 1);
+});
+
+test("shared Codex auth waits for Resume without blocking tickets, then resumes the saved thread", async (t) => {
+  const task = issue(1);
+  const f = await fixture(t, [task]);
+  const reload = t.mock.method(f.codex, "reloadAuthentication");
+  await f.machine.tick(1_000);
+  await until(() => f.codex.runs.length === 1);
+  const original = f.store.jobs()[0];
+  f.codex.runs[0].finish({ outcome: "failed", failure: "auth" });
+  await f.machine.drain();
+  await f.machine.tick(3_000);
+  assert.equal(f.machine.dashboard().auth?.service, "Codex");
   assert.equal(f.linear.issues.get(task.id)!.state, "In Progress");
+  assert.equal(f.codex.runs.length, 1);
+  assert.equal(reload.mock.callCount(), 0);
+  f.machine.setPaused("all", false);
+  await f.machine.tick(5_000);
+  await until(() => f.codex.runs.length === 2);
+  assert.equal(reload.mock.callCount(), 1);
+  assert.equal(f.machine.dashboard().auth, undefined);
+  assert.equal(f.codex.runs[1].input.threadId, original.threadId);
   assert.deepEqual(f.linear.updates, []);
-  assert.deepEqual(f.linear.comments, []);
+});
+
+test("GitHub auth pauses the affected repository while other projects can dispatch", async (t) => {
+  const task = issue(1);
+  const other = { id: "other", team: "Other", project: "Other Project" };
+  const f = await fixture(
+    t,
+    [task, issue(2, { team: other.team, project: other.project })],
+    [other],
+  );
+  const health = f.github.masterHealth.bind(f.github);
+  let authorized = false;
+  t.mock.method(f.github, "masterHealth", async () => {
+    if (!authorized) throw new SharedAuthError("GitHub");
+    return health();
+  });
+  await f.machine.tick(1_000);
+  await until(() => f.codex.runs.length === 1);
+  assert.equal(f.codex.runs[0].input.title, "ENG-2 · Lead");
+  assert.equal(f.machine.dashboard().projects[0].auth?.service, "GitHub");
+  assert.equal(f.linear.issues.get(task.id)!.state, "Todo");
+  authorized = true;
+  f.store.setPaused("demo", false);
+  await f.machine.tick(3_000);
+  await until(() => f.codex.runs.length === 2);
+  assert.equal(f.codex.runs[1].input.title, "ENG-1 · Lead");
+  assert.equal(f.machine.dashboard().projects[0].auth, undefined);
+});
+
+test("an evidenced transient agent failure retries once after a polling interval", async (t) => {
+  const task = issue(1);
+  const f = await fixture(t, [task]);
+  const now = Date.now();
+  await f.machine.tick(now);
+  await until(() => f.codex.runs.length === 1);
+  const original = f.store.jobs()[0];
+  f.codex.runs[0].finish({ outcome: "failed", failure: "transient" });
+  await f.machine.drain();
+  assert.equal(f.linear.issues.get(task.id)!.state, "In Progress");
+  await f.machine.tick(now + 500);
+  assert.equal(f.codex.runs.length, 1);
+  await f.machine.tick(Date.now() + 1_000);
+  await until(() => f.codex.runs.length === 2);
+  assert.equal(f.codex.runs[1].input.threadId, original.threadId);
+  f.codex.runs[1].finish({ outcome: "failed", failure: "transient" });
+  await f.machine.drain();
+  assert.equal(f.linear.issues.get(task.id)!.state, "Blocked");
+  assert.match(f.linear.comments[0].body, /failed again after one retry/);
 });
 
 test("startup recovery resumes a review interrupted before its unchanged fingerprint completed", async (t) => {
@@ -1331,7 +1515,7 @@ test("pending PR CI waits in Review without dispatching an agent or marking the 
   await until(() => f.codex.runs.length === 1);
 });
 
-test("required human review holds In Review and a reviewer failure does not declare an external blocker", async (t) => {
+test("required human review holds In Review while failed review can be requeued to the same reviewer", async (t) => {
   for (const human of [true, false]) {
     await t.test(human ? "human review" : "technical failure", async (t) => {
       const task = issue(1, { state: "In Review", prUrls: [pr(1).url] });
@@ -1339,6 +1523,7 @@ test("required human review holds In Review and a reviewer failure does not decl
       f.github.prs.set(1, pr(1));
       await f.machine.tick(1_000);
       await until(() => f.codex.runs.length === 1);
+      const original = f.store.jobs()[0];
       f.codex.runs[0].finish(
         human
           ? {
@@ -1353,13 +1538,30 @@ test("required human review holds In Review and a reviewer failure does not decl
           : { outcome: "failed", error: "GitHub tool unavailable" },
       );
       await f.machine.drain();
-      assert.equal(f.linear.issues.get(task.id)!.state, "In Review");
+      assert.equal(
+        f.linear.issues.get(task.id)!.state,
+        human ? "In Review" : "Blocked",
+      );
       assert.equal(
         f.linear.issues.get(task.id)!.labels.includes("needs-human"),
         human,
       );
       await f.machine.tick(3_000);
       assert.equal(f.codex.runs.length, 1);
+      if (!human) {
+        assert.match(
+          f.linear.comments[0].body,
+          /Independent review stopped.*In Review/,
+        );
+        await f.linear.updateIssue(task.id, { state: "In Review" });
+        await f.machine.tick(5_000);
+        await until(() => f.codex.runs.length === 2);
+        assert.equal(f.codex.runs[1].input.threadId, original.threadId);
+        assert.equal(
+          f.codex.runs[1].input.title,
+          `${task.identifier} · Review`,
+        );
+      }
     });
   }
 });

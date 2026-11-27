@@ -2,6 +2,9 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { MaintenanceScan } from "./maintenance.js";
+import type { AuthService } from "./recovery.js";
+
+export type AuthHold = { service: AuthService; resumeRequested?: boolean };
 
 export type Job = {
   id: string;
@@ -22,6 +25,7 @@ export type Job = {
   // Last completed independent PR review; discussion remains on GitHub.
   reviewedHead?: string;
   fingerprint?: string;
+  transientRetryAt?: number;
   summary?: string;
   maintenance?: MaintenanceScan;
   createdIssueIds?: string[];
@@ -51,6 +55,33 @@ export class Store {
         "INSERT INTO jobs VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
       )
       .run(job.id, JSON.stringify(job));
+  }
+  transaction(write: () => void) {
+    this.db.exec("BEGIN");
+    try {
+      write();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+  get maintenancePaused() {
+    return this.get<boolean>("maintenance_paused") === true;
+  }
+  setPaused(scope: string, paused: boolean, maintenanceOnly = false) {
+    if (maintenanceOnly) {
+      if (scope !== "all")
+        throw new Error("Maintenance pause applies to all repositories");
+      this.set("maintenance_paused", paused);
+      return;
+    }
+    this.transaction(() => {
+      this.set(`pause:${scope}`, paused);
+      const auth = this.get<AuthHold>(`auth:${scope}`);
+      if (auth)
+        this.set(`auth:${scope}`, { ...auth, resumeRequested: !paused });
+    });
   }
   get<T>(key: string): T | undefined {
     const row = this.db.prepare("SELECT data FROM kv WHERE key=?").get(key) as

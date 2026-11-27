@@ -3,9 +3,10 @@ import retry from "retry";
 import type { Config, Repo } from "./config.js";
 import { gitConfig, routing } from "./config.js";
 import { GitHub, type PrInfo } from "./github.js";
-import { CodexRunner } from "./codex.js";
+import { CodexRunner, type RunInput, type RunResult } from "./codex.js";
 import type { LinearClient, LinearIssue } from "./linear.js";
-import { Store, type Job } from "./store.js";
+import { Store, type AuthHold, type Job } from "./store.js";
+import { newSessionLabel, SharedAuthError } from "./recovery.js";
 import { maintenanceDirections } from "./maintenance.js";
 import type { DashboardSnapshot, DashboardTicket } from "./dashboard.js";
 import {
@@ -45,8 +46,27 @@ type Sync = {
   issueId: string;
   state?: string;
   labels?: string[];
+  addLabels?: string[];
+  removeLabels?: string[];
+  fromStates?: string[];
   comment?: string;
 };
+class JobFailure extends Error {
+  constructor(
+    message: string,
+    readonly kind?: RunResult["failure"] | "human-input",
+  ) {
+    super(message);
+  }
+}
+
+function agentFailure(response: RunResult, fallback: string): Error {
+  if (response.failure === "auth") return new SharedAuthError("Codex");
+  return new JobFailure(
+    response.error ?? fallback,
+    response.outcome === "blocked" ? "human-input" : response.failure,
+  );
+}
 export type Log = (event: string, details?: unknown) => void;
 // These arguments are displayed for manual copying, never executed by the runner.
 const shellArgument = (value: string) =>
@@ -75,6 +95,7 @@ export class Machine {
   private next = new Map<string, number>();
   private backoffs = new Map<string, { failures: number; until: number }>();
   private pauseStates = new Map<string, boolean>();
+  private flushing?: Promise<void>;
   private stopping = false;
   constructor(
     public config: Config,
@@ -137,16 +158,25 @@ export class Machine {
   }
   dashboard(): DashboardSnapshot {
     const jobs = this.store.jobs();
+    const globalAuth = this.authHold("all");
     return {
       updatedAt: new Date().toISOString(),
-      paused: this.store.get<boolean>("pause:all") === true,
+      paused: !!globalAuth || this.store.get<boolean>("pause:all") === true,
+      auth: globalAuth,
       activeAgents: this.activeCount,
+      maintenancePaused: this.store.maintenancePaused,
+      activeMaintenanceAgents: [...this.active.values()].filter(
+        (a) => a.job.role === "maintenance",
+      ).length,
       stopping: this.stopping,
       projects: this.config.repositories.map((r) => ({
         id: r.id,
         name: r.id,
         repository: r.github,
-        paused: this.store.get<boolean>(`pause:${r.id}`) === true,
+        paused:
+          !!this.authHold(r.id) ||
+          this.store.get<boolean>(`pause:${r.id}`) === true,
+        auth: this.authHold(r.id),
         effectivePaused: this.paused(r.id),
         activeAgents: [...this.active.values()].filter(
           (a) => a.job.repo === r.id,
@@ -325,6 +355,7 @@ export class Machine {
         stale: true,
       });
       this.log("dashboard_poll_error", { repo: r.id, error: String(error) });
+      if (error instanceof SharedAuthError) this.holdForAuth(error, r.id);
       return false;
     }
   }
@@ -332,12 +363,12 @@ export class Machine {
     this.stopping = true;
     if (force) for (const a of this.active.values()) a.abort.abort();
   }
-  setPaused(repo: string, paused: boolean) {
+  setPaused(repo: string, paused: boolean, maintenanceOnly = false) {
     if (repo !== "all" && !this.config.repositories.some((r) => r.id === repo))
       throw new Error(`Unknown repository ${repo}`);
-    this.store.set(`pause:${repo}`, paused);
+    this.store.setPaused(repo, paused, maintenanceOnly);
     this.applyPause();
-    this.log("pause_changed", { repo, paused });
+    this.log("pause_changed", { repo, paused, maintenanceOnly });
   }
   private applyPause() {
     for (const r of this.config.repositories) {
@@ -352,8 +383,14 @@ export class Machine {
         }
       }
     }
+    const maintenancePaused = this.store.maintenancePaused;
     for (const a of this.active.values())
-      if (this.paused(a.job.repo)) a.abort.abort();
+      if (
+        this.store.get<boolean>("pause:all") ||
+        this.store.get<boolean>(`pause:${a.job.repo}`) ||
+        (maintenancePaused && a.job.role === "maintenance")
+      )
+        a.abort.abort();
   }
   async drain() {
     await Promise.allSettled([...this.active.values()].map((a) => a.promise));
@@ -396,9 +433,52 @@ export class Machine {
   }
   private paused(repo: string) {
     return (
+      !!this.authHold("all") ||
+      !!this.authHold(repo) ||
       this.store.get<boolean>("pause:all") === true ||
       this.store.get<boolean>(`pause:${repo}`) === true
     );
+  }
+  private authHold(scope: string) {
+    return this.store.get<AuthHold | null>(`auth:${scope}`) ?? undefined;
+  }
+  private holdForAuth(error: SharedAuthError, repo?: string) {
+    const scope = error.service === "GitHub" && repo ? repo : "all";
+    if (this.authHold(scope)) return;
+    this.store.set(`auth:${scope}`, { service: error.service });
+    this.log("auth_required", { repo: scope, service: error.service });
+  }
+  private async resumeAuth(scope: string, repo?: Repo) {
+    const hold = this.authHold(scope);
+    if (!hold?.resumeRequested || this.stopping) return;
+    if (hold.service === "Codex" && this.activeCount) return;
+    try {
+      switch (hold.service) {
+        case "Linear":
+          await this.linear.reconnect();
+          break;
+        case "Codex":
+          await this.runner.reloadAuthentication();
+          break;
+        case "GitHub":
+          await this.githubFactory(repo!).masterHealth();
+          break;
+      }
+      this.store.set(`auth:${scope}`, null);
+      if (scope === "all") this.backoffs.delete("outbox");
+      const scopes = repo ? [repo] : this.config.repositories;
+      for (const r of scopes) {
+        this.backoffs.delete(`repo:${r.id}`);
+        this.backoffs.delete(`dashboard:${r.id}`);
+        for (const key of this.next.keys())
+          if (key.startsWith(`${r.id}:`) || key === `dashboard:${r.id}`)
+            this.next.delete(key);
+      }
+      this.log("auth_resumed", { repo: scope, service: hold.service });
+    } catch {
+      this.store.set(`auth:${scope}`, { service: hold.service });
+      this.log("auth_resume_failed", { repo: scope, service: hold.service });
+    }
   }
   private dispatchStopped(repo: string) {
     return this.stopping || this.paused(repo);
@@ -436,16 +516,43 @@ export class Machine {
     pending.push({ id: randomUUID(), ...change });
     this.store.set("outbox", pending);
   }
-  async flush() {
+  flush() {
+    this.flushing ??= this.flushOutbox().finally(() => {
+      this.flushing = undefined;
+    });
+    return this.flushing;
+  }
+  private async flushOutbox() {
+    if (this.authHold("all")?.service === "Linear") return;
     let pending = this.store.get<Sync[]>("outbox") ?? [];
     while (pending.length) {
       const item = pending[0];
-      if (item.state || item.labels)
-        await this.linear.updateIssue(item.issueId, {
-          state: item.state,
-          labels: item.labels,
-        });
-      if (item.comment) await this.linear.comment(item.issueId, item.comment);
+      if (
+        !item.fromStates ||
+        item.fromStates.includes(
+          (await this.linear.getIssue(item.issueId)).state,
+        )
+      ) {
+        if (item.state || item.labels || item.addLabels || item.removeLabels)
+          await this.linear.updateIssue(item.issueId, {
+            state: item.state,
+            labels: item.labels,
+            ...(item.addLabels ? { addLabels: item.addLabels } : {}),
+            ...(item.removeLabels ? { removeLabels: item.removeLabels } : {}),
+          });
+        // Persist the comment-only remainder after applying an issue transition.
+        if (item.fromStates && item.comment) {
+          this.store.set(
+            "outbox",
+            (this.store.get<Sync[]>("outbox") ?? []).map((change) =>
+              change.id === item.id
+                ? { id: item.id, issueId: item.issueId, comment: item.comment }
+                : change,
+            ),
+          );
+        }
+        if (item.comment) await this.linear.comment(item.issueId, item.comment);
+      }
       pending = (this.store.get<Sync[]>("outbox") ?? []).filter(
         (x) => x.id !== item.id,
       );
@@ -455,6 +562,7 @@ export class Machine {
   async tick(now = Date.now()) {
     // CLI pause flags must interrupt active turns even during sync cooldowns.
     this.applyPause();
+    await this.resumeAuth("all");
     const started = Date.now();
     const completedAt = () => now + Date.now() - started;
     if (!this.retryReady("outbox", now)) return;
@@ -462,6 +570,10 @@ export class Machine {
       await this.flush();
       this.backoffs.delete("outbox");
     } catch (error) {
+      if (error instanceof SharedAuthError) {
+        this.holdForAuth(error);
+        return;
+      }
       this.log("sync_error", {
         error: String(error),
         ...this.backoff(
@@ -474,6 +586,7 @@ export class Machine {
     }
     if (this.stopping) return;
     for (const r of this.config.repositories) {
+      if (!this.paused("all")) await this.resumeAuth(r.id, r);
       const repositoryPoll = `repo:${r.id}`;
       if (!this.paused(r.id) && this.retryReady(repositoryPoll, now)) {
         let interval = this.config.polling.linear_seconds;
@@ -499,18 +612,22 @@ export class Machine {
             this.due(`${r.id}:review`, this.config.polling.review_seconds, now)
           ) {
             interval = this.config.polling.review_seconds;
-            await this.reviews(r);
+            await this.reviews(r, completedAt());
           }
           if (
             this.due(`${r.id}:linear`, this.config.polling.linear_seconds, now)
           ) {
             interval = this.config.polling.linear_seconds;
-            await this.executions(r);
+            await this.executions(r, completedAt());
           }
           interval = this.config.polling.linear_seconds;
           await this.maintenance(r, now);
           this.backoffs.delete(repositoryPoll);
         } catch (error) {
+          if (error instanceof SharedAuthError) {
+            this.holdForAuth(error, r.id);
+            continue;
+          }
           // A failed poll must remain a gate on subsequent ticks, even when
           // the failed lane's original deadline has not arrived yet.
           for (const key of this.next.keys())
@@ -560,10 +677,35 @@ export class Machine {
     const promise = Promise.resolve()
       .then(() => fn(abort.signal))
       .catch((error) => {
-        j.status =
-          abort.signal.aborted || this.runner.failure ? "waiting" : "failed";
         j.summary = String(error);
-        this.store.save(j);
+        if (error instanceof SharedAuthError) this.holdForAuth(error, j.repo);
+        if (
+          abort.signal.aborted ||
+          this.runner.failure ||
+          error instanceof SharedAuthError
+        ) {
+          j.status = "waiting";
+          this.store.save(j);
+        } else if (issue && (j.role === "execution" || j.role === "review")) {
+          const r = this.config.repositories.find(
+            (repo) => repo.id === j.repo,
+          )!;
+          const kind = error instanceof JobFailure ? error.kind : undefined;
+          if (kind === "transient" && j.transientRetryAt === undefined) {
+            const interval =
+              j.role === "execution"
+                ? this.config.polling.linear_seconds
+                : this.config.polling.review_seconds;
+            j.transientRetryAt = Date.now() + interval * 1000;
+            j.status = "waiting";
+            this.store.save(j);
+          } else {
+            this.blockJob(r, j, kind);
+          }
+        } else {
+          j.status = "failed";
+          this.store.save(j);
+        }
         this.log("job_error", {
           job: j.id,
           issue: j.identifier,
@@ -587,6 +729,61 @@ export class Machine {
       startedAt: new Date().toISOString(),
     });
     this.log("job_started", { job: j.id, issue: j.identifier, role: j.role });
+  }
+  private blockJob(r: Repo, j: Job, kind?: JobFailure["kind"]) {
+    const review = j.role === "review";
+    const phase = review ? "Independent review" : "Execution";
+    const queue = review ? r.states.review : r.states.todo;
+    const reason =
+      kind === "missing-thread"
+        ? `The saved Codex session could not be loaded. Add \`${newSessionLabel}\` to start a fresh session.`
+        : kind === "transient"
+          ? "The Codex connection failed again after one retry. Check connectivity before requeuing."
+          : kind === "human-input"
+            ? `The unattended session requested human input. Check the saved session and record the decision before clearing \`${this.config.linear.needs_human_label}\`.`
+            : "The agent did not complete this attempt. Check the runner diagnostics and saved session for the failure.";
+    const pr = j.prNumber
+      ? ` PR: https://github.com/${r.github}/pull/${j.prNumber}.`
+      : "";
+    j.status = "blocked";
+    j.transientRetryAt = undefined;
+    this.store.transaction(() => {
+      this.store.save(j);
+      this.sync({
+        issueId: j.issueId,
+        state: r.states.blocked,
+        fromStates: review ? [queue] : [queue, r.states.in_progress],
+        addLabels:
+          kind === "human-input"
+            ? [this.config.linear.needs_human_label]
+            : undefined,
+        comment: `${phase} stopped. ${reason}${pr} When resolved, move this issue to **${queue}** to continue.`,
+      });
+    });
+  }
+  private pendingTicketRecovery(issueId: string) {
+    return this.store
+      .get<Sync[]>("outbox")
+      ?.some(
+        (change) =>
+          change.issueId === issueId &&
+          (change.fromStates || change.removeLabels?.includes(newSessionLabel)),
+      );
+  }
+  private runTicket(j: Job, issue: LinearIssue, input: RunInput) {
+    const fresh = issue.labels.includes(newSessionLabel);
+    return this.runner.run({
+      ...input,
+      threadId: fresh ? undefined : j.threadId,
+      onThread: (id) => {
+        j.threadId = id;
+        this.store.transaction(() => {
+          this.store.save(j);
+          if (fresh)
+            this.sync({ issueId: issue.id, removeLabels: [newSessionLabel] });
+        });
+      },
+    });
   }
   async dependenciesReady(issue: LinearIssue, r: Repo): Promise<boolean> {
     for (const dep of issue.blockedBy) {
@@ -626,7 +823,7 @@ export class Machine {
     }
     return true;
   }
-  private async executions(r: Repo) {
+  private async executions(r: Repo, now: number) {
     if (this.dispatchStopped(r.id)) return;
     const c = this.config;
     let issues = await this.linear.listIssues({
@@ -665,7 +862,9 @@ export class Machine {
       const recovering =
         old?.status === "waiting" && issue.state === r.states.in_progress;
       if (issue.state !== r.states.todo && !recovering) continue;
-      if (this.skipIssue(issue)) continue;
+      if (this.skipIssue(issue) || this.pendingTicketRecovery(issue.id))
+        continue;
+      if (old?.transientRetryAt && now < old.transientRetryAt) continue;
       if (old?.status === "failed" && old.fingerprint === issue.updatedAt)
         continue;
       if (old?.workspace && this.store.get(`cleaned:${old.id}`)) continue;
@@ -679,8 +878,7 @@ export class Machine {
           const git = this.githubFactory(r);
           if (!j.workspace) j.workspace = await git.prepare(issue.identifier);
           this.store.save(j);
-          const response = await this.runner.run({
-            threadId: j.threadId,
+          const response = await this.runTicket(j, issue, {
             title: `${issue.identifier} · Lead`,
             cwd: r.path,
             writableRoots: [j.workspace.path],
@@ -696,10 +894,6 @@ export class Machine {
             prompt: executionPrompt(c, r, issue, j),
             ...route.lead,
             signal,
-            onThread: (id) => {
-              j.threadId = id;
-              this.store.save(j);
-            },
           });
           if (response.outcome === "interrupted") {
             j.status = "waiting";
@@ -707,13 +901,14 @@ export class Machine {
             return;
           }
           if (response.outcome !== "completed")
-            throw new Error(response.error ?? `Agent ${response.outcome}`);
+            throw agentFailure(response, `Agent ${response.outcome}`);
           const latest = await this.linear.getIssue(issue.id);
           const pr = await git.findPr(j.workspace.branch);
           if (pr && pr.branch === j.workspace.branch && pr.base === r.branch)
             j.prNumber = pr.number;
           j.summary = response.text;
           j.fingerprint = latest.updatedAt;
+          j.transientRetryAt = undefined;
           j.status =
             latest.state === r.states.review ||
             latest.state === r.states.ready_to_merge ||
@@ -724,14 +919,18 @@ export class Machine {
                 ? "blocked"
                 : latest.state === r.states.in_progress
                   ? "waiting"
-                  : "failed";
+                  : "blocked";
+          if (latest.state === r.states.todo && !this.skipIssue(latest)) {
+            this.blockJob(r, j);
+            return;
+          }
           this.store.save(j);
         },
         issue,
       );
     }
   }
-  private async reviews(r: Repo) {
+  private async reviews(r: Repo, now: number) {
     if (this.dispatchStopped(r.id)) return;
     const issues = await this.linear.listIssues({
       team: r.team,
@@ -744,7 +943,8 @@ export class Machine {
         r.concurrency.reviews
       )
         break;
-      if (this.skipIssue(issue)) continue;
+      if (this.skipIssue(issue) || this.pendingTicketRecovery(issue.id))
+        continue;
       const execution = this.job(r.id, issue.id, "execution");
       const own = issue.prUrls
         .map((u) =>
@@ -762,15 +962,21 @@ export class Machine {
       if (pr.state !== "OPEN" || pr.base !== r.branch || pr.draft) continue;
       const old = this.job(r.id, issue.id, "review");
       if (old && this.active.has(old.id)) continue;
+      if (old?.transientRetryAt && now < old.transientRetryAt) continue;
       const context = await git.reviewContext(number);
       const fingerprint = JSON.stringify([
         pr.head,
         issue.title,
         issue.description,
-        issue.labels,
+        issue.labels.filter((label) => label !== newSessionLabel),
         context.fingerprint,
       ]);
-      if (old?.fingerprint === fingerprint) continue;
+      if (
+        old?.fingerprint === fingerprint &&
+        old.status !== "blocked" &&
+        old.status !== "waiting"
+      )
+        continue;
       if (pr.checks !== "success") {
         if (pr.checks === "failure")
           this.sync({
@@ -788,8 +994,7 @@ export class Machine {
       this.launch(
         j,
         async (signal) => {
-          const response = await this.runner.run({
-            threadId: j.threadId,
+          const response = await this.runTicket(j, issue, {
             title: `${issue.identifier} · Review`,
             cwd: r.path,
             developerInstructions: contract(this.config, r),
@@ -803,10 +1008,6 @@ export class Machine {
             ),
             ...this.config.codex.review,
             signal,
-            onThread: (id) => {
-              j.threadId = id;
-              this.store.save(j);
-            },
           });
           if (response.outcome === "interrupted") {
             j.status = "waiting";
@@ -815,8 +1016,9 @@ export class Machine {
             return;
           }
           if (response.outcome !== "completed" || !response.result)
-            throw new Error(response.error ?? `Review ${response.outcome}`);
+            throw agentFailure(response, `Review ${response.outcome}`);
           const result = response.result;
+          j.transientRetryAt = undefined;
           j.summary = result.summary;
           j.status = "done";
           const current = await git.pr(number);
@@ -842,7 +1044,7 @@ export class Machine {
             current.head,
             latestIssue.title,
             latestIssue.description,
-            latestIssue.labels,
+            latestIssue.labels.filter((label) => label !== newSessionLabel),
             reviewedContext.fingerprint,
           ]);
           if (result.decision === "ready_to_merge") {
@@ -1122,10 +1324,9 @@ You are the Merge planning agent for group ${group.id}, separate from the progra
           response.outcome !== "completed" ||
           response.result?.decision !== "done"
         )
-          throw new Error(
-            response.error ??
-              response.result?.summary ??
-              "Merge planning failed",
+          throw agentFailure(
+            response,
+            response.result?.summary ?? "Merge planning failed",
           );
         const order = response.result.issueIds ?? [];
         if (
@@ -1294,6 +1495,7 @@ You are the Merge planning agent for group ${group.id}, separate from the progra
         this.store.set(`cleaned:${j.id}`, true);
         this.log("cleaned", { issue: j.identifier });
       } catch (error) {
+        if (error instanceof SharedAuthError) throw error;
         const text = String(error);
         if (this.store.get(`cleanup_error:${j.id}`) !== text) {
           this.sync({
@@ -1310,6 +1512,7 @@ You are the Merge planning agent for group ${group.id}, separate from the progra
     const c = this.config;
     if (
       this.dispatchStopped(r.id) ||
+      this.store.maintenancePaused ||
       !c.maintenance.enabled ||
       this.count("maintenance", r.id) >= r.concurrency.maintenance_scans
     )
@@ -1362,6 +1565,7 @@ You are the Merge planning agent for group ${group.id}, separate from the progra
         j.maintenance = { direction, from, to };
         this.store.save(j);
       }
+      signal.throwIfAborted();
       const scan = j.maintenance;
       if (scan.from === scan.to) {
         j.status = "done";
@@ -1390,8 +1594,9 @@ You are the Merge planning agent for group ${group.id}, separate from the progra
         return;
       }
       if (result.outcome !== "completed" || result.result?.decision !== "done")
-        throw new Error(
-          result.error ?? result.result?.summary ?? "Maintenance failed",
+        throw agentFailure(
+          result,
+          result.result?.summary ?? "Maintenance failed",
         );
       j.status = "done";
       j.summary = result.result.summary;

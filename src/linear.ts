@@ -8,13 +8,17 @@ import {
   type OAuthClientProvider,
   type OAuthDiscoveryState,
 } from "@modelcontextprotocol/sdk/client/auth.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import {
+  StreamableHTTPClientTransport,
+  StreamableHTTPError,
+} from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type {
   OAuthClientInformationMixed,
   OAuthClientMetadata,
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
+import { SharedAuthError } from "./recovery.js";
 
 export interface LinearIssue {
   id: string;
@@ -129,7 +133,7 @@ class FileOAuthProvider implements OAuthClientProvider {
     return !!this.expectedState && value === this.expectedState;
   }
   redirectToAuthorization(url: URL): void {
-    if (!this.interactive) throw loginRequired();
+    if (!this.interactive) throw new SharedAuthError("Linear");
     this.onAuthUrl(url.toString());
   }
   saveCodeVerifier(value: string): void {
@@ -159,9 +163,13 @@ class FileOAuthProvider implements OAuthClientProvider {
   }
 }
 
-function loginRequired(): Error {
-  return new Error(
-    "Linear authentication required. Run the Symphony login command first.",
+function isAuthFailure(error: unknown): boolean {
+  return (
+    error instanceof SharedAuthError ||
+    error instanceof UnauthorizedError ||
+    (error instanceof StreamableHTTPError && error.code === 401) ||
+    (error instanceof Error &&
+      /\b(?:invalid_grant|invalid_token)\b/i.test(error.message))
   );
 }
 
@@ -190,14 +198,19 @@ export class LinearClient {
   async connect(): Promise<void> {
     if (this.client) return;
     await this.auth.load();
-    if (!this.auth.tokens()) throw loginRequired();
+    if (!this.auth.tokens()) throw new SharedAuthError("Linear");
     try {
       await this.open();
     } catch (error) {
       await this.closeConnection();
-      if (error instanceof UnauthorizedError) throw loginRequired();
+      if (isAuthFailure(error)) throw new SharedAuthError("Linear");
       throw error;
     }
+  }
+
+  async reconnect(): Promise<void> {
+    await this.closeConnection();
+    await this.connect();
   }
 
   /** Interactive OAuth on a loopback listener; access and refresh tokens stay in authDir. */
@@ -359,17 +372,26 @@ export class LinearClient {
     const input = Object.fromEntries(
       Object.entries(args).filter(([, value]) => value !== undefined),
     );
-    const result = (await this.client.callTool({
-      name: tool.name,
-      arguments: input,
-    })) as CallToolResult;
+    let result: CallToolResult;
+    try {
+      result = (await this.client.callTool({
+        name: tool.name,
+        arguments: input,
+      })) as CallToolResult;
+    } catch (error) {
+      if (isAuthFailure(error)) throw new SharedAuthError("Linear");
+      throw error;
+    }
     const texts = result.content
       .filter((item) => item.type === "text")
       .map((item) => item.text);
-    if (result.isError)
-      throw new Error(
+    if (result.isError) {
+      const error = new Error(
         `Linear MCP ${tool.name} failed: ${texts.join("\n").slice(0, 2000)}`,
       );
+      if (isAuthFailure(error)) throw new SharedAuthError("Linear");
+      throw error;
+    }
     if (result.structuredContent !== undefined) return result.structuredContent;
     if (!texts.length)
       throw new Error(`Linear MCP ${tool.name} returned no JSON data.`);
@@ -515,7 +537,12 @@ export class LinearClient {
 
   async updateIssue(
     id: string,
-    patch: { state?: string; labels?: string[] },
+    patch: {
+      state?: string;
+      labels?: string[];
+      addLabels?: string[];
+      removeLabels?: string[];
+    },
   ): Promise<void> {
     await this.call(this.tool(["save_issue", "update_issue"]), {
       id,

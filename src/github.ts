@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { appendFile, lstat, mkdir, readFile } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
+import { SharedAuthError } from "./recovery.js";
 
 export type CheckStatus = "pending" | "success" | "failure" | "unknown";
 
@@ -90,6 +91,21 @@ export type CommandRunner = (
   args: string[],
   cwd: string,
 ) => Promise<CommandResult>;
+
+function checkAuthentication(file: "git" | "gh", result: CommandResult) {
+  if (!result.code) return;
+  const message = result.stderr || result.stdout;
+  if (
+    (file === "gh" &&
+      (result.code === 4 ||
+        /HTTP 401\b|\bbad credentials\b|gh auth login/i.test(message))) ||
+    (file === "git" &&
+      /authentication failed|could not read Username|permission denied \(publickey\)/i.test(
+        message,
+      ))
+  )
+    throw new SharedAuthError("GitHub");
+}
 
 /** Credentials stay in the caller's environment or existing Git/gh login. */
 export const runCommand: CommandRunner = (file, args, cwd) =>
@@ -289,6 +305,7 @@ export class GitHub {
     cwd = this.repo.path,
   ): Promise<string> {
     const result = await this.runner(file, args, cwd);
+    checkAuthentication(file, result);
     if (result.code !== 0)
       throw new Error(
         `${file} ${args[0]} failed: ${(result.stderr || result.stdout).trim()}`,
@@ -664,6 +681,7 @@ export class GitHub {
       this.repo.path,
     );
     if (required.code !== 0) {
+      checkAuthentication("gh", required);
       if (
         !/^no required checks reported on the '.+' branch\s*$/.test(
           required.stderr.trim(),

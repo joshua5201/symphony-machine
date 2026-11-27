@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Config } from "./config.js";
-import type { Job } from "./store.js";
+import type { AuthHold, Job } from "./store.js";
 import { dashboardPage } from "./dashboard-page.js";
 
 export type DashboardTicket = {
@@ -32,13 +32,17 @@ export type DashboardTicket = {
 export type DashboardSnapshot = {
   updatedAt: string;
   paused: boolean;
+  auth?: AuthHold;
   activeAgents: number;
+  maintenancePaused: boolean;
+  activeMaintenanceAgents: number;
   stopping: boolean;
   projects: {
     id: string;
     name: string;
     repository: string;
     paused: boolean;
+    auth?: AuthHold;
     effectivePaused: boolean;
     activeAgents: number;
     ticketsUpdatedAt: string | null;
@@ -60,7 +64,7 @@ export type DashboardSnapshot = {
 export async function startDashboard(
   options: Config["dashboard"],
   snapshot: () => DashboardSnapshot,
-  control: (repo: string, paused: boolean) => void,
+  control: (repo: string, paused: boolean, maintenanceOnly: boolean) => void,
 ) {
   const server = createServer(async (request, response) => {
     response.setHeader("Cache-Control", "no-store");
@@ -124,6 +128,18 @@ export async function startDashboard(
         response.end("Repository and pause flag required");
         return;
       }
+      const maintenanceOnly =
+        "maintenanceOnly" in input ? input.maintenanceOnly : false;
+      if (
+        typeof maintenanceOnly !== "boolean" ||
+        (maintenanceOnly && input.repo !== "all")
+      ) {
+        response.writeHead(400);
+        response.end(
+          "Maintenance pause requires a boolean flag and all repositories",
+        );
+        return;
+      }
       try {
         const current = snapshot();
         if (
@@ -139,7 +155,7 @@ export async function startDashboard(
           response.end("Runner is stopping");
           return;
         }
-        control(input.repo, input.paused);
+        control(input.repo, input.paused, maintenanceOnly);
         response.writeHead(200, {
           "Content-Type": "application/json; charset=utf-8",
         });

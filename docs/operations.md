@@ -95,9 +95,15 @@ Run `npm start -- doctor --config symphony.yaml` after setup or connection chang
 | A dependency remains waiting       | Check its Linear state and linked PR targets. Historical/superseded PR links can hold it; clarify obsolete links rather than guessing which PR counts.            |
 | Cleanup keeps a worktree           | Check for active agents, dirty files, or local commits not contained in the merged PR. Resolve retained work before expecting cleanup.                            |
 
-For execution/review recovery, use `status` to inspect recorded jobs and sessions, and `retry --issue TEAM-123` to return failed/blocked work to its queue. Retry does not remove control labels. See the [Linear contract](../agents/workflows/LINEAR-CONTRACT.md) for the full handoff rules.
+An execution or independent review failure that requires intervention moves the issue to Blocked with a recovery comment. An identified transient Codex failure gets one retry after the relevant polling interval. Once resolved, put execution work back in Todo or review-only work in In Review. `status` shows saved jobs and `retry --issue TEAM-123` can also requeue a failed job.
+
+The next eligible attempt resumes the recorded thread. If you want a fresh conversation or the saved thread is unavailable, apply `new-session` before requeuing. The runner removes the label after recording the new thread, and continues from the current worktree, branch and PR. Control labels, dependencies and review checks still determine eligibility.
+
+A shared Codex or controller Linear auth failure suspends dispatch globally. Git or gh auth failures suspend the affected repository. The dashboard names the affected service. After signing in, use its Resume control or `resume --repo all` for global auth and `resume --repo <id>` for repository auth. Resume reloads the Codex or Linear connection as needed. If the runner process exited, start it with the same data directory and resume any remaining auth hold.
 
 Pause interrupts managed turns and keeps sessions/worktrees for resumption; already-issued external operations may finish settling. Global pause overrides per-repository flags, and resuming globally preserves individually paused repositories. CLI controls apply on the next runner poll; dashboard controls apply immediately.
+
+The maintenance control pauses scans across all repositories and saves any interrupted scan for resumption with the same session and commit range. The flag survives restart and is independent of global and repository pauses. Resuming scans makes them eligible at the next runner poll, subject to the usual configuration and capacity checks.
 
 On shutdown, first `Ctrl+C` drains work and a second interrupts it. After a crash or app-server exit, restart the same `run` command with the same data directory to reconcile saved work. Execution checkpoints reuse their thread/worktree; interrupted reviews are scheduled again. Cleanup failures do not repeat implementation or merging. Only one runner can use a data directory at a time; stale process locks are reclaimed on restart.
 

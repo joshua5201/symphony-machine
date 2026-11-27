@@ -18,7 +18,7 @@ const server = String.raw`
     event('item/agentMessage/delta', { threadId, turnId, itemId: 'final', delta: text.slice(0, 12) });
     event('item/agentMessage/delta', { threadId, turnId, itemId: 'final', delta: text.slice(12) });
     event('item/completed', { threadId, turnId, item: { id: 'final', type: 'agentMessage', text, phase: 'final_answer' } });
-    event('turn/completed', { threadId, turn: { id: turnId, status, items: [], error: status === 'failed' ? { message: 'Inference failed' } : null } });
+    event('turn/completed', { threadId, turn: { id: turnId, status, items: [], error: status === 'failed' ? config.turnError || { message: 'Inference failed' } : null } });
   };
   readline.createInterface({ input: process.stdin }).on('line', line => {
     const message = JSON.parse(line);
@@ -394,6 +394,39 @@ test("requires existing ChatGPT sign-in without initiating login", async (t) => 
   assert.equal(result.outcome, "failed");
   assert.match(result.error!, /ChatGPT sign-in is required/);
   assert.ok(!requests().some((call) => call.method === "turn/start"));
+});
+
+test("recognizes revoked OAuth credentials and reloads the connection without replacing the thread", async (t) => {
+  const { runner, requests } = setup({
+    status: "failed",
+    turnError: {
+      message:
+        "Your access token could not be refreshed because your refresh token was revoked. Please sign out and sign in again.",
+      codexErrorInfo: "other",
+    },
+  });
+  t.after(() => runner.close());
+  const failed = await runner.run({ cwd: "/tmp", prompt: "work" });
+  assert.equal(failed.failure, "auth");
+  await runner.reloadAuthentication();
+  const retried = await runner.run({
+    cwd: "/tmp",
+    prompt: "retry",
+    threadId: failed.threadId,
+  });
+  assert.equal(retried.threadId, failed.threadId);
+  assert.equal(
+    requests().filter((call) => call.method === "initialize").length,
+    2,
+  );
+  assert.equal(
+    requests().filter((call) => call.method === "thread/start").length,
+    1,
+  );
+  assert.equal(
+    requests().filter((call) => call.method === "thread/resume").length,
+    1,
+  );
 });
 
 test("returns paginated MCP connection metadata without credentials or tool schemas", async (t) => {

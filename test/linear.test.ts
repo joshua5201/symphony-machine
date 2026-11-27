@@ -31,6 +31,7 @@ const standardTools = () => [
     "description",
     "state",
     "labels",
+    "removeLabels",
   ]),
   tool("save_comment", ["issueId", "body"]),
 ];
@@ -420,6 +421,7 @@ test("uses advertised save_issue/save_comment schemas for writes", async (t) => 
     state: "Todo",
     labels: ["symphony"],
   });
+  await client.updateIssue("3", { removeLabels: ["new-session"] });
   assert.equal(created.id, "3");
   assert.deepEqual(remote.calls.slice(0, 3), [
     {
@@ -441,6 +443,10 @@ test("uses advertised save_issue/save_comment schemas for writes", async (t) => 
       },
     },
   ]);
+  assert.deepEqual(remote.calls.at(-1), {
+    name: "save_issue",
+    arguments: { id: "3", removeLabels: ["new-session"] },
+  });
 });
 
 test("maps hosted MCP id/uuid fields and resolves minimal blocker relations", async (t) => {
@@ -452,7 +458,9 @@ test("maps hosted MCP id/uuid fields and resolves minimal blocker relations", as
         return {
           content: [],
           structuredContent: {
-            issues: [{ id: "ENG-101", uuid: issueUuid, title: "Current issue" }],
+            issues: [
+              { id: "ENG-101", uuid: issueUuid, title: "Current issue" },
+            ],
             hasNextPage: false,
           },
         };

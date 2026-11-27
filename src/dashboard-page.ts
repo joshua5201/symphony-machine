@@ -57,7 +57,7 @@ export const dashboardPage: string = String.raw`<!doctype html>
     .project-title { margin: 0; font-size: 18px; letter-spacing: -.025em; overflow-wrap: anywhere; }
     .repository { margin: 4px 0 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
     .runner-control { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
-    #runner-control { margin-bottom: 18px; }
+    #runner-control { display: flex; flex-wrap: wrap; gap: 10px 24px; margin-bottom: 18px; }
     .control-state { color: var(--muted); font-size: 12px; line-height: 1.7; }
     .control-state[data-state="paused"], .control-state[data-state="pausing"] { color: #94651f; }
     .control-button { border: 1px solid #cbd6e8; border-radius: 7px; background: #fff; color: var(--accent); padding: 8px 12px; cursor: pointer; font-size: 12px; min-height: 36px; }
@@ -210,7 +210,8 @@ export const dashboardPage: string = String.raw`<!doctype html>
     let controlVersion = 0;
     const retryDelays = ${JSON.stringify(retryDelays)};
     const globalControl = createControl('all');
-    document.getElementById('runner-control').append(globalControl.root);
+    const maintenanceControl = createControl('all', true);
+    document.getElementById('runner-control').append(globalControl.root, maintenanceControl.root);
 
     function element(tag, className, text) {
       const node = document.createElement(tag);
@@ -224,18 +225,18 @@ export const dashboardPage: string = String.raw`<!doctype html>
       if (node.textContent !== text) node.textContent = text;
     }
 
-    function createControl(repo) {
+    function createControl(repo, maintenanceOnly = false) {
       const root = element('div', 'runner-control');
       const state = element('span', 'control-state', '正在讀取執行狀態…');
       state.setAttribute('role', 'status');
       state.setAttribute('aria-live', 'polite');
-      const button = element('button', 'control-button', repo === 'all' ? '暫停全部' : '暫停專案');
+      const button = element('button', 'control-button', maintenanceOnly ? '只暫停維護掃描' : repo === 'all' ? '暫停全部' : '暫停專案');
       button.type = 'button';
       button.disabled = true;
       button.addEventListener('click', () => {
         if (!lastSnapshot || pendingControl !== null || button.disabled) return;
         const scope = repo === 'all' ? lastSnapshot : lastSnapshot.projects.find((p) => p.id === repo);
-        if (scope) changePause(repo, !scope.paused);
+        if (scope) changePause(repo, !(maintenanceOnly ? scope.maintenancePaused : scope.paused), maintenanceOnly);
       });
       root.append(state, button);
       return { root, state, button };
@@ -247,24 +248,33 @@ export const dashboardPage: string = String.raw`<!doctype html>
       const state = lastSnapshot.stopping ? 'stopping' : paused ? (scope.activeAgents > 0 ? 'pausing' : 'paused') : 'running';
       view.state.dataset.state = state;
       const labels = { running: '執行中', pausing: '暫停中', paused: '已暫停', stopping: '正在關閉' };
-      setText(view.state, (global ? '全域：' : inherited ? '全域控制：' : '專案：') + labels[state] + ' · ' + scope.activeAgents + ' 個工作執行中');
-      setText(view.button, pendingControl === (global ? 'all' : scope.id)
+      const auth = scope.auth;
+      const authStatus = auth ? (auth.resumeRequested ? auth.service + ' 等待重新連線' : auth.service + ' 需要重新登入') : labels[state];
+      setText(view.state, (global ? '全域：' : inherited ? '全域控制：' : '專案：') + authStatus + ' · ' + scope.activeAgents + ' 個工作執行中');
+      setText(view.button, (!pendingControl?.maintenanceOnly && pendingControl?.repo === (global ? 'all' : scope.id)) || auth?.resumeRequested
         ? '處理中…'
         : inherited ? '全域已暫停' : scope.paused ? (global ? '解除全域暫停' : '繼續專案') : (global ? '暫停全部' : '暫停專案'));
-      view.button.disabled = pendingControl !== null || inherited || lastSnapshot.stopping;
+      view.button.disabled = pendingControl !== null || inherited || lastSnapshot.stopping || !!auth?.resumeRequested;
     }
 
     function updateControls() {
       if (!lastSnapshot) return;
       updateControl(globalControl, lastSnapshot, true);
+      const { maintenancePaused, activeMaintenanceAgents, stopping } = lastSnapshot;
+      const state = stopping ? 'stopping' : maintenancePaused ? (activeMaintenanceAgents > 0 ? 'pausing' : 'paused') : 'running';
+      const status = { running: '', pausing: '暫停中 · ', paused: '已暫停 · ', stopping: '正在關閉 · ' };
+      maintenanceControl.state.dataset.state = state;
+      setText(maintenanceControl.state, '維護掃描：' + status[state] + activeMaintenanceAgents + ' 個執行中');
+      setText(maintenanceControl.button, pendingControl?.maintenanceOnly ? '處理中…' : maintenancePaused ? '繼續維護掃描' : '只暫停維護掃描');
+      maintenanceControl.button.disabled = pendingControl !== null || stopping;
       for (const project of lastSnapshot.projects) {
         const view = projectViews.get(project.id);
         if (view) updateControl(view.control, project, false);
       }
     }
 
-    async function changePause(repo, paused) {
-      pendingControl = repo;
+    async function changePause(repo, paused, maintenanceOnly) {
+      pendingControl = { repo, maintenanceOnly };
       controlVersion++;
       clearTimeout(refreshTimer);
       refreshTimer = null;
@@ -276,7 +286,7 @@ export const dashboardPage: string = String.raw`<!doctype html>
         const response = await fetch('/api/control', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-Symphony-Control': '1' },
-          body: JSON.stringify({ repo, paused }),
+          body: JSON.stringify(maintenanceOnly ? { repo, paused, maintenanceOnly } : { repo, paused }),
           signal: controller.signal,
         });
         if (!response.ok) throw new Error('Control request failed');

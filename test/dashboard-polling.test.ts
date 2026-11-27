@@ -114,6 +114,9 @@ function pollingPage(initiallyHidden = false) {
     get control() {
       return nodes.get("runner-control").children[0];
     },
+    get maintenanceControl(): PageNode {
+      return nodes.get("runner-control").children[1];
+    },
     get error() {
       return nodes.get("control-error");
     },
@@ -127,6 +130,8 @@ function pollingPage(initiallyHidden = false) {
           updatedAt: "2026-11-11T00:00:00Z",
           paused: false,
           activeAgents: 0,
+          maintenancePaused: false,
+          activeMaintenanceAgents: 0,
           stopping: false,
           projects: [],
           ...data,
@@ -204,6 +209,31 @@ test("dashboard pause controls submit the desired state, disable duplicate click
   );
   await page.respond();
   assert.equal(button.disabled, false);
+});
+
+test("dashboard toggles the maintenance pause independently of the global pause", async () => {
+  const page = pollingPage();
+  await page.respond();
+  const [state, button] = page.maintenanceControl.children;
+  button.listeners.get("click")!();
+  assert.deepEqual(JSON.parse(page.requests.at(-1)!.options.body!), {
+    repo: "all",
+    paused: true,
+    maintenanceOnly: true,
+  });
+  await page.respond(true, { maintenancePaused: true, activeAgents: 1 });
+  assert.match(state.textContent, /已暫停/);
+  assert.match(button.textContent, /繼續維護掃描/);
+  assert.match(page.control.children[1].textContent, /暫停全部/);
+  await page.respond(true, { maintenancePaused: true, activeAgents: 1 });
+  button.listeners.get("click")!();
+  assert.deepEqual(JSON.parse(page.requests.at(-1)!.options.body!), {
+    repo: "all",
+    paused: false,
+    maintenanceOnly: true,
+  });
+  await page.respond();
+  assert.match(button.textContent, /只暫停維護掃描/);
 });
 
 test("dashboard backs off failed status requests, caps the delay, and resets after recovery", async () => {

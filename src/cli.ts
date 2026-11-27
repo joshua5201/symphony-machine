@@ -14,7 +14,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { execFileSync } from "node:child_process";
 import { loadConfig, gitConfig } from "./config.js";
 import { GitHub } from "./github.js";
-import { Store } from "./store.js";
+import { Store, type AuthHold } from "./store.js";
 import { LinearClient } from "./linear.js";
 import { CodexRunner } from "./codex.js";
 import { Machine } from "./machine.js";
@@ -32,7 +32,7 @@ const option = (name: string, fallback: string) => {
 async function main() {
   if (command === "help" || args.includes("--help")) {
     console.log(
-      `Symphony Machine — personal foreground runner\n\n  npm start -- run --config symphony.yaml\n  npm start -- doctor --config symphony.yaml\n  npm start -- linear-login --config symphony.yaml\n  npm start -- status --config symphony.yaml\n  npm start -- pause|resume --repo all --config symphony.yaml\n  npm start -- retry --issue TEAM-123 --config symphony.yaml\n\nFirst Ctrl+C drains active work. Second Ctrl+C interrupts and saves resumable state.\nPolling, merge timing, concurrency and maintenance settings reload automatically; other changes need restart.`,
+      `Symphony Machine — personal foreground runner\n\n  npm start -- run --config symphony.yaml\n  npm start -- doctor --config symphony.yaml\n  npm start -- linear-login --config symphony.yaml\n  npm start -- status --config symphony.yaml\n  npm start -- pause|resume --repo all --config symphony.yaml\n  npm start -- pause|resume --maintenance --config symphony.yaml\n  npm start -- retry --issue TEAM-123 --config symphony.yaml\n\nFirst Ctrl+C drains active work. Second Ctrl+C interrupts and saves resumable state.\nPolling, merge timing, concurrency and maintenance settings reload automatically; other changes need restart.`,
     );
     return;
   }
@@ -73,9 +73,12 @@ async function main() {
       JSON.stringify(
         {
           paused: store.get("pause:all") ?? false,
+          maintenancePaused: store.maintenancePaused,
+          auth: store.get<AuthHold>("auth:all") ?? undefined,
           repositories: config.repositories.map((r) => ({
             id: r.id,
             paused: store.get(`pause:${r.id}`) ?? false,
+            auth: store.get<AuthHold>(`auth:${r.id}`) ?? undefined,
             health: store.get(`health:${r.id}`),
           })),
           jobs: store.jobs(),
@@ -92,11 +95,13 @@ async function main() {
     const repo = option("--repo", "all");
     if (repo !== "all" && !config.repositories.some((r) => r.id === repo))
       throw new Error(`Unknown repository ${repo}`);
-    store.set(`pause:${repo}`, command === "pause");
+    const maintenanceOnly = args.includes("--maintenance");
+    store.setPaused(repo, command === "pause", maintenanceOnly);
+    const scope = maintenanceOnly ? "maintenance scans" : repo;
     console.log(
       command === "pause"
-        ? `pause: ${repo} (the runner will interrupt active agents on its next poll)`
-        : `resume: ${repo} (work continues on the runner's next poll)`,
+        ? `pause: ${scope} (the runner will interrupt active agents on its next poll)`
+        : `resume: ${scope} (work continues on the runner's next poll)`,
     );
     store.close();
     return;
@@ -113,19 +118,37 @@ async function main() {
     if (!jobs.length) throw new Error(`No job found for ${identifier}`);
     if (jobs.some((j) => j.status === "running"))
       throw new Error("Cannot retry an active job");
-    const execution = jobs.find((j) => j.role === "execution");
-    const job = execution ?? jobs[0];
-    const repo = config.repositories.find((r) => r.id === job.repo)!;
-    await linear.connect();
+    const repo = config.repositories.find((r) => r.id === jobs[0].repo)!;
     try {
+      await linear.connect();
+      const issue = await linear.getIssue(jobs[0].issueId);
+      const job =
+        issue.state === repo.states.blocked
+          ? jobs
+              .filter((j) => j.status === "blocked" || j.status === "failed")
+              .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0]
+          : [
+                repo.states.todo,
+                repo.states.in_progress,
+                repo.states.review,
+              ].includes(issue.state)
+            ? jobs.find(
+                (j) =>
+                  j.role ===
+                  (issue.state === repo.states.review ? "review" : "execution"),
+              )
+            : undefined;
+      if (!job || job.status === "done")
+        throw new Error(
+          `No retryable job found for ${identifier} in ${issue.state}`,
+        );
       await linear.updateIssue(job.issueId, {
         state: job.role === "execution" ? repo.states.todo : repo.states.review,
       });
-      for (const j of jobs) {
-        j.status = "waiting";
-        j.fingerprint = undefined;
-        store.save(j);
-      }
+      job.status = "waiting";
+      job.fingerprint = undefined;
+      job.transientRetryAt = undefined;
+      store.save(job);
       console.log(`Retry requested for ${identifier}`);
     } finally {
       await linear.close();
@@ -251,7 +274,8 @@ async function main() {
       dashboard = await startDashboard(
         config.dashboard,
         () => runningMachine.dashboard(),
-        (repo, paused) => runningMachine.setPaused(repo, paused),
+        (repo, paused, maintenanceOnly) =>
+          runningMachine.setPaused(repo, paused, maintenanceOnly),
       );
       log("dashboard_listening", { url: dashboard.url });
     }
