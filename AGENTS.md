@@ -16,4 +16,4 @@ A personal, foreground workflow runner. The repository is public; the runtime an
 - Render ticket titles and findings as text, accept only HTTP(S) links, and keep resume commands shell-quoted and copy-only. Use project tabs, desktop Kanban and vertically stacked phone sections; preserve maintenance history and session disclosures during polling.
 - Never restart or interrupt a live runner merely to apply dashboard edits or publish source. Leave process lifecycle actions to explicit user authorization.
 - Run npm run check and npm test for behavioral changes. Tests should cover requirements and actual regression risks, not mirror implementation.
-- Use GPT-6.1 Sol with xhigh reasoning for delegated development when subagents are useful (user-authorized for this repository).
+- Use GPT-6.2 Sol with xhigh reasoning for delegated development when subagents are useful (user-authorized for this repository).

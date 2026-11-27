@@ -17,10 +17,10 @@ codex:
   args: [app-server, --listen, "stdio://"]
   linear_mcp_server: linear
   workflow: ~/.agents/workflows/WORKFLOW.md
-  lead: { model: gpt-6.1-sol, reasoning: xhigh }
-  implementation: { model: gpt-6.1-sol, reasoning: xhigh }
-  review: { model: gpt-6.1-sol, reasoning: xhigh }
-  maintenance: { model: gpt-6.1-sol, reasoning: xhigh }
+  lead: { model: gpt-6.2-sol, reasoning: xhigh }
+  implementation: { model: gpt-6.2-sol, reasoning: xhigh }
+  review: { model: gpt-6.2-sol, reasoning: xhigh }
+  maintenance: { model: gpt-6.2-sol, reasoning: xhigh }
 
 polling:
   linear_seconds: 120

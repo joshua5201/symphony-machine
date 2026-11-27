@@ -67,8 +67,8 @@ Runner 的 headless session 使用 launcher 指定的官方 Linear MCP 取代 De
 | --- | --- | --- |
 | Intake | gpt-6-astra | medium |
 | Lead | gpt-5.6-sol | high |
-| Implementation | gpt-6.1-sol | high |
-| Code Reviewer（Codex） | gpt-6.1-sol | xhigh |
+| Implementation | gpt-6.2-sol | high |
+| Code Reviewer（Codex） | gpt-6.2-sol | xhigh |
 
 模型是預設，不是角色限制。由低到高套用：共用預設 → project override → Linear ticket label → 本次 prompt／人類明確指示；只覆蓋指定欄位。Evaluation 指定是有效 override，不需再核准同一選擇。派工時傳入實際解析後的 model／reasoning；組合不受工具支援時回報，不默默換回預設。
 

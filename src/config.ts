@@ -11,7 +11,7 @@ const concurrency = z.object({
   maintenance_scans: positive.default(1),
 });
 const role = z.object({
-  model: z.string().default("gpt-6.1-sol"),
+  model: z.string().default("gpt-6.2-sol"),
   reasoning: z
     .enum(["low", "medium", "high", "xhigh", "max", "ultra"])
     .default("xhigh"),
