@@ -201,7 +201,16 @@ export class Machine {
           ticket.updatedAt ??
           "",
       ) || 0;
-    const tickets = [...ids].map((id): DashboardTicket => {
+    const columns = [
+      "todo",
+      "in_progress",
+      "ready_to_merge",
+      "review",
+      "blocked",
+      "done",
+    ] as const;
+    const tickets: DashboardTicket[] = [];
+    for (const id of ids) {
       const active = [...this.active.values()].find(
         (a) =>
           a.job.repo === r.id &&
@@ -209,32 +218,20 @@ export class Machine {
           a.issue,
       );
       const issue = cached?.get(id) ?? active?.issue;
+      const state = issue?.state ?? null;
+      const column = columns.find((key) => r.states[key] === state);
+      if (!column) continue;
       const previous = history
         .filter((j) => (identities.get(j.issueId) ?? j.issueId) === id)
         .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
       const agent = active?.job ?? previous;
-      const state = issue?.state ?? null;
-      const column: DashboardTicket["column"] =
-        state === r.states.todo
-          ? "todo"
-          : state === r.states.in_progress
-            ? "in_progress"
-            : state === r.states.ready_to_merge
-              ? "ready_to_merge"
-              : state === r.states.review
-                ? "review"
-                : state === r.states.blocked
-                  ? "blocked"
-                  : state === r.states.done
-                    ? "done"
-                    : "other";
       const blockedAt =
         issue?.stateHistory
           ?.filter((entry) => entry.state === r.states.blocked)
           .map((entry) => entry.startedAt)
           .sort()
           .at(-1) ?? null;
-      return {
+      tickets.push({
         id,
         identifier: issue?.identifier ?? previous?.identifier ?? id,
         title: issue?.title ?? previous?.identifier ?? id,
@@ -282,8 +279,8 @@ export class Machine {
         updatedAt: issue?.updatedAt ?? null,
         completedAt: issue?.completedAt ?? null,
         blockedAt,
-      };
-    });
+      });
+    }
     return tickets.sort((a, b) => latestTime(b) - latestTime(a));
   }
   private async pollDashboard(r: Repo) {

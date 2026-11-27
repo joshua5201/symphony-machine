@@ -193,7 +193,7 @@ export const dashboardPage: string = String.raw`<!doctype html>
     const ticketColumns = [
       ['todo', 'Todo'], ['in_progress', '進行中'], ['review', 'Review'],
       ['ready_to_merge', 'Ready to merge'],
-      ['blocked', 'Blocked'], ['done', 'Done'], ['other', '其他']
+      ['blocked', 'Blocked'], ['done', 'Done']
     ];
     const dateTime = new Intl.DateTimeFormat('zh-TW', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
     const eventTime = new Intl.DateTimeFormat('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
@@ -549,7 +549,7 @@ export const dashboardPage: string = String.raw`<!doctype html>
         const empty = element('p', 'column-empty', '暫無工作');
         root.append(heading, list, empty);
         board.append(root);
-        columns.set(key, { root, count, list, empty });
+        columns.set(key, { count, list, empty });
       }
       boardScroll.append(board);
       ticketSection.append(ticketHeading, boardScroll);
@@ -603,7 +603,6 @@ export const dashboardPage: string = String.raw`<!doctype html>
       for (const [key, column] of view.columns) {
         const nodes = columnNodes.get(key);
         setText(column.count, nodes.length);
-        column.root.hidden = key === 'other' && nodes.length === 0;
         column.empty.hidden = nodes.length > 0;
         orderChildren(column.list, nodes);
       }

@@ -389,7 +389,7 @@ test("dashboard groups tickets and live agents by project and retains maintenanc
   );
 });
 
-test("kanban shows all Todo and handled tickets with independent Linear and agent state, event times, and session commands", async (t) => {
+test("kanban shows Todo and handled workflow tickets with independent Linear and agent state, event times, and session commands", async (t) => {
   const finishedAt = "2026-11-08T12:10:00Z";
   const blockedAt = "2026-11-07T08:00:00Z";
   const tasks = [
@@ -410,6 +410,7 @@ test("kanban shows all Todo and handled tickets with independent Linear and agen
     issue(8, { state: "Blocked" }),
     issue(9, { state: "Backlog" }),
     issue(10, { state: "Merge queue" }),
+    issue(11, { state: "Duplicate" }),
   ];
   const f = await fixture(t, tasks);
   f.config.linear.needs_human_label = "human-review";
@@ -427,7 +428,11 @@ test("kanban shows all Todo and handled tickets with independent Linear and agen
   f.store.save(savedJob(tasks[9], "review", { status: "done" }));
   f.store.save(
     savedJob(issue(90), "maintenance", {
-      createdIssueIds: [tasks[8].identifier, tasks[0].identifier],
+      createdIssueIds: [
+        tasks[8].identifier,
+        tasks[0].identifier,
+        tasks[10].identifier,
+      ],
     }),
   );
   const jobsBefore = f.store.jobs();
@@ -440,9 +445,7 @@ test("kanban shows all Todo and handled tickets with independent Linear and agen
     "ENG-3",
     "ENG-4",
     "ENG-5",
-    "ENG-7",
     "ENG-8",
-    "ENG-9",
   ]);
   const byId = (id: string) =>
     project.tickets.find((ticket) => ticket.identifier === id)!;
@@ -462,9 +465,7 @@ test("kanban shows all Todo and handled tickets with independent Linear and agen
   assert.equal(byId("ENG-5").column, "review");
   assert.equal(byId("ENG-5").agentStatus, "done");
   assert.equal(byId("ENG-5").completedAt, null);
-  assert.equal(byId("ENG-7").column, "other");
   assert.equal(byId("ENG-8").blockedAt, null);
-  assert.equal(byId("ENG-9").column, "other");
   assert.equal(byId("ENG-10").column, "ready_to_merge");
   assert.equal(byId("ENG-10").state, "Merge queue");
   assert.equal(byId("ENG-10").agentStatus, "done");

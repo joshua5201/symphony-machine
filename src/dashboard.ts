@@ -19,8 +19,7 @@ export type DashboardTicket = {
     | "review"
     | "ready_to_merge"
     | "blocked"
-    | "done"
-    | "other";
+    | "done";
   state: string | null;
   needsHumanReview: boolean;
   noAutoPickupLabel: string | null;
